@@ -25,7 +25,7 @@ CAPITAL = int(os.environ.get("CAPITAL", "500000"))
 STRATEGY = os.environ.get("STRATEGY", "iron_condor")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-API_SESSION = os.environ.get("API_SESSION", "")
+API_SESSION = os.environ.get("API_SESSION", "54638372")
 
 # ============================================
 # DATA STORAGE
