@@ -28,7 +28,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 # 💰 CAPITAL & POSITION SIZING
 # ============================================
 CAPITAL = int(os.environ.get("CAPITAL", "500000"))
-QUANTITY = 25             # Nifty lot size
+QUANTITY = 65             # Nifty lot size
 
 # ============================================
 # 📊 STRATEGY SELECTION
