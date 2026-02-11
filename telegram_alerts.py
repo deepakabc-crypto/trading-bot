@@ -69,3 +69,4 @@ class TelegramAlert:
     def send_error(self, error_msg):
         """Send error alert."""
         return self.send(f"🚨 *ERROR*\n```\n{error_msg}\n```")
+        
