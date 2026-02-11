@@ -1,0 +1,9 @@
+breeze-connect
+flask
+gunicorn
+pandas
+numpy
+requests
+schedule
+pytz
+python-telegram-bot
