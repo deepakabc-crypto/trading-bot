@@ -8,10 +8,10 @@ Setup:
     2. pip install breeze-connect pandas
 
 Usage:
-    python backtest.py --strategy iron_condor --from 2024-01-01 --to 2024-12-31
-    python backtest.py --strategy short_straddle --from 2024-06-01 --to 2024-12-31
-    python backtest.py --strategy both --from 2024-01-01 --to 2024-12-31
-    python backtest.py --simulate  # No API credentials needed
+    python backtest.py --strategy iron_condor --days 180
+    python backtest.py --strategy short_straddle --days 90
+    python backtest.py --strategy both --days 365
+    python backtest.py --simulate --days 60  # No API credentials needed
 
 Configuration:
     All settings are in settings.py — API keys, strategy params, capital, costs.
@@ -148,18 +148,10 @@ class BreezeDataFetcher:
         interval: str = "1minute",
     ) -> list:
         """
-        Fetch historical OHLCV data for a specific option contract.
-
-        Args:
-            strike: Strike price (e.g., 22000)
-            option_type: "call" or "put"
-            expiry_date: Expiry in "YYYY-MM-DD" format
-            from_date: Start date "YYYY-MM-DD"
-            to_date: End date "YYYY-MM-DD"
-            interval: "1minute", "5minute", "30minute", "1day"
+        Fetch historical OHLCV data for a specific option contract using v1 API.
         """
         try:
-            data = self.breeze.get_historical_data_v2(
+            data = self.breeze.get_historical_data(
                 interval=interval,
                 from_date=f"{from_date}T07:00:00.000Z",
                 to_date=f"{to_date}T16:00:00.000Z",
@@ -168,31 +160,37 @@ class BreezeDataFetcher:
                 product_type="options",
                 expiry_date=f"{expiry_date}T07:00:00.000Z",
                 right=option_type,
-                strike_price=str(strike),
+                strike_price=str(int(strike)),
             )
-            if data and data.get("Success"):
+            if data and data.get("Success") and len(data["Success"]) > 0:
                 return data["Success"]
-            log.warning(f"No data for NIFTY {strike}{option_type} exp={expiry_date}")
+            log.debug(f"No data for NIFTY {strike}{option_type} exp={expiry_date}")
             return []
         except Exception as e:
-            log.error(f"Breeze API error: {e}")
+            log.error(f"Breeze API error for {strike}{option_type}: {e}")
             return []
 
     def get_spot_price(self, date: str) -> Optional[float]:
-        """Fetch Nifty spot closing price for a given date."""
-        try:
-            data = self.breeze.get_historical_data_v2(
-                interval="1day",
-                from_date=f"{date}T07:00:00.000Z",
-                to_date=f"{date}T16:00:00.000Z",
-                stock_code="NIFTY",
-                exchange_code="NSE",
-                product_type="cash",
-            )
-            if data and data.get("Success"):
-                return float(data["Success"][0]["close"])
-        except Exception as e:
-            log.error(f"Spot price fetch error: {e}")
+        """Fetch Nifty spot closing price using v1 API."""
+        for days_back in range(0, 4):
+            check_date = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            try:
+                data = self.breeze.get_historical_data(
+                    interval="1day",
+                    from_date=f"{check_date}T07:00:00.000Z",
+                    to_date=f"{check_date}T16:00:00.000Z",
+                    stock_code="NIFTY",
+                    exchange_code="NSE",
+                )
+                if data and data.get("Success") and len(data["Success"]) > 0:
+                    spot = float(data["Success"][0]["close"])
+                    log.debug(f"Spot {date} = {spot} (from {check_date})")
+                    return spot
+            except Exception as e:
+                log.debug(f"Spot fetch failed for {check_date}: {e}")
+                continue
+
+        log.warning(f"Could not fetch spot data for {date}")
         return None
 
     def get_expiry_dates(self, from_date: str, to_date: str) -> list:
@@ -484,6 +482,7 @@ class Backtester:
         log.info(f"📆 Found {len(expiries)} expiry dates")
 
         trade_id = 0
+        skipped = 0
         for i, expiry in enumerate(expiries):
             expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
 
@@ -491,6 +490,8 @@ class Backtester:
             entry_date = expiry  # Same-day entry for simplicity
             spot = self.fetcher.get_spot_price(entry_date)
             if spot is None:
+                skipped += 1
+                log.warning(f"  ⚠️ Skipping {entry_date} — could not fetch spot price")
                 continue
 
             dte = max((expiry_dt - datetime.strptime(entry_date, "%Y-%m-%d")).days, 0)
@@ -555,6 +556,11 @@ class Backtester:
                 f"P&L: ₹{net_pnl:>+10,.2f} | Exit: {exit_reason:<8} | "
                 f"Capital: ₹{self.capital:>12,.2f}"
             )
+
+        if skipped > 0:
+            log.warning(f"⚠️ Skipped {skipped}/{len(expiries)} expiries due to missing data")
+        if trade_id == 0:
+            log.error("❌ No trades executed. Check your API connection or use --simulate for simulated data.")
 
         return self._compute_results()
 
@@ -725,12 +731,14 @@ def main():
     parser = argparse.ArgumentParser(description="Nifty Options Backtester")
     parser.add_argument("--strategy", choices=["iron_condor", "short_straddle", "both"],
                         default=settings.STRATEGY, help="Strategy to backtest")
-    parser.add_argument("--from", dest="from_date", default="2024-01-01", help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--to", dest="to_date", default="2024-12-31", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--days", type=int, default=90, help="Number of days to backtest (from today backwards)")
     parser.add_argument("--capital", type=float, default=settings.CAPITAL,
                         help="Initial capital (₹)")
     parser.add_argument("--simulate", action="store_true", help="Use simulated data (no API needed)")
     args = parser.parse_args()
+
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
 
     # Initialize data fetcher
     api_key = settings.API_KEY
@@ -746,6 +754,7 @@ def main():
     if not args.simulate and has_credentials:
         try:
             fetcher = BreezeDataFetcher(api_key, api_secret, session_token)
+            log.info("🔗 Data source: ICICI Breeze API (live)")
         except Exception as e:
             log.warning(f"⚠️ Breeze connection failed: {e}. Falling back to simulation.")
             fetcher = SimulatedDataFetcher()
@@ -753,6 +762,7 @@ def main():
         if not args.simulate:
             log.info("ℹ️  No API credentials found. Use --simulate or update settings.py")
         fetcher = SimulatedDataFetcher()
+        log.info("🔗 Data source: Simulated")
 
     strategies = (
         ["iron_condor", "short_straddle"] if args.strategy == "both"
@@ -764,8 +774,8 @@ def main():
             fetcher=fetcher,
             strategy=strat,
             capital=args.capital,
-            from_date=args.from_date,
-            to_date=args.to_date,
+            from_date=from_date,
+            to_date=to_date,
         )
         result = bt.run()
         print_report(result)

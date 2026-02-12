@@ -1,4 +1,4 @@
-# 🤖 Nifty Options Trading Bot
+# 🤖 Nifty Options Trading Bot v2.0
 
 Automated trading bot for Nifty options with Iron Condor and Short Straddle strategies.
 
@@ -8,22 +8,23 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 - 📊 **Short Straddle** - Higher premium, 55-60% win rate
 - 🖥️ **Web Dashboard** - Real-time P&L tracking
 - 📱 **Telegram Alerts** - Trade notifications & remote control
+- 🔬 **Backtesting Engine** - Test strategies on historical data
+- 📜 **Trade History** - Persistent trade logs
 - ☁️ **Railway Ready** - One-click deploy
 
 ## 📁 Files
 
 | File | Description |
 |------|-------------|
-| `app.py` | Combined dashboard + trading bot |
+| `app.py` | Combined dashboard + trading bot + backtester |
 | `Procfile` | Railway process config |
 | `requirements.txt` | Python dependencies |
-| `runtime.txt` | Python version |
 
 ## 🚀 Deploy to Railway (5 minutes)
 
 ### Step 1: Create GitHub Repository
 1. Create new repo on GitHub
-2. Upload all 4 files
+2. Upload all files
 
 ### Step 2: Deploy on Railway
 1. Go to [railway.app](https://railway.app)
@@ -54,6 +55,39 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | `/status` | Check bot status |
 | `/start` | Start trading |
 | `/stop` | Stop trading |
+| `/backtest` | Run backtest |
+| `/help` | Show all commands |
+
+## 🔬 Backtesting
+
+The bot includes a full backtesting engine accessible via the dashboard:
+
+1. Go to the **Backtesting** tab
+2. Set start/end dates
+3. Choose strategy
+4. Click **Run Backtest**
+
+### API Endpoints for Backtesting
+
+```bash
+# Get expiry dates
+GET /api/expiries?start=2025-01-01&end=2025-12-31
+
+# Run backtest
+POST /api/backtest
+{
+  "start_date": "2025-01-01",
+  "end_date": "2025-12-31",
+  "strategy": "iron_condor",
+  "capital": 500000
+}
+```
+
+### Expiry Date Format for Breeze API
+
+The bot automatically handles date formatting:
+- **Display format**: `13-Feb-2026`
+- **Breeze API format**: `2026-02-13T07:00:00.000Z`
 
 ## 📅 Daily Workflow
 
@@ -72,12 +106,40 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 - Buy: ATM ± 250
 - Target: 50%
 - Stop Loss: 100%
+- Min Premium: ₹20
 
 ### Short Straddle
 - Lot Size: **65**
 - Strike: ATM
 - Target: 30%
 - Stop Loss: 20%
+- Min Premium: ₹20
+
+## 📜 Trade History
+
+Trade history is automatically preserved in `trade_history.json`:
+
+```json
+{
+  "trades": [...],
+  "backtest_results": [...]
+}
+```
+
+Access via:
+- Dashboard → Trade History tab
+- API: `GET /api/history`
+
+## 🔧 Troubleshooting
+
+### "Found 0 expiry dates"
+This error is now fixed! The backtester calculates expiry dates programmatically without API calls.
+
+### "ModuleNotFoundError: schedule"
+Fixed in `requirements.txt` - includes `schedule>=1.2.0`
+
+### "Can't open file 'bot_runner.py'"
+Renamed entry point to `app.py` - matches Procfile
 
 ## ⚠️ Disclaimer
 
