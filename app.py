@@ -725,10 +725,76 @@ class Backtester:
             "expiry": expiry.strftime("%Y-%m-%d")
         }
     
+    def simulate_intraday_exit(self, entry_premium: float, target_pct: float, sl_pct: float,
+                                entry_time: str, exit_time: str) -> Dict:
+        """
+        Simulate intraday price movement and determine exit
+        Returns: exit_time, exit_reason, pnl_percent
+        """
+        import random
+        
+        # Parse times
+        entry_hour, entry_min = map(int, entry_time.split(':'))
+        exit_hour, exit_min = map(int, exit_time.split(':'))
+        
+        # Simulate price checking every 15 minutes
+        current_hour = entry_hour
+        current_min = entry_min
+        
+        # Track cumulative premium change (negative = profit for short positions)
+        premium_change_pct = 0
+        
+        while True:
+            # Move forward 15 minutes
+            current_min += 15
+            if current_min >= 60:
+                current_min -= 60
+                current_hour += 1
+            
+            # Check if we've reached exit time
+            current_time_mins = current_hour * 60 + current_min
+            exit_time_mins = exit_hour * 60 + exit_min
+            
+            if current_time_mins >= exit_time_mins:
+                return {
+                    "exit_time": exit_time,
+                    "exit_reason": "TIME_EXIT",
+                    "pnl_percent": premium_change_pct
+                }
+            
+            # Simulate random price movement (-5% to +5% per interval)
+            move = (random.random() - 0.5) * 10  # Random move
+            premium_change_pct += move
+            
+            # Check target (premium decreased by target_pct)
+            if premium_change_pct <= -target_pct:
+                return {
+                    "exit_time": f"{current_hour:02d}:{current_min:02d}",
+                    "exit_reason": "TARGET",
+                    "pnl_percent": target_pct  # Lock in target
+                }
+            
+            # Check stop loss (premium increased by sl_pct)
+            if premium_change_pct >= sl_pct:
+                return {
+                    "exit_time": f"{current_hour:02d}:{current_min:02d}",
+                    "exit_reason": "STOP_LOSS",
+                    "pnl_percent": -sl_pct  # Lock in loss
+                }
+    
     def run_backtest(self, start_date: datetime, end_date: datetime, 
-                     strategy: str = "iron_condor", initial_capital: float = 500000) -> Dict:
-        """Run backtest for given period"""
+                     strategy: str = "iron_condor", initial_capital: float = 500000,
+                     entry_time_start: str = None, entry_time_end: str = None,
+                     exit_time: str = None) -> Dict:
+        """Run backtest for given period using bot's entry/exit times"""
+        
+        # Use provided times or defaults from settings
+        entry_start = entry_time_start or ENTRY_TIME_START
+        entry_end = entry_time_end or ENTRY_TIME_END
+        force_exit = exit_time or EXIT_TIME
+        
         logger.info(f"🔬 Starting backtest: {strategy} from {start_date.date()} to {end_date.date()}")
+        logger.info(f"⏰ Entry Window: {entry_start} - {entry_end}, Exit Time: {force_exit}")
         
         expiries = self.get_expiry_dates(start_date, end_date)
         
@@ -743,79 +809,152 @@ class Backtester:
         
         trades = []
         capital = initial_capital
-        spot = 22500  # Default spot, should fetch from API/data
+        spot = 22500  # Default spot
         
+        # Get trading days for each expiry week
         for expiry in expiries:
-            # Skip if expiry is before start date
             if expiry < start_date:
                 continue
             
-            # Simulate entry on Monday before expiry (or expiry day if it's Monday)
-            entry_date = expiry - timedelta(days=3)
-            if entry_date < start_date:
-                entry_date = start_date
+            # Get all trading days for this expiry week (Mon-Thu or Mon-Fri before expiry)
+            week_start = expiry - timedelta(days=expiry.weekday())  # Monday of expiry week
             
-            if strategy in ["iron_condor", "both"]:
-                trade = self.simulate_iron_condor(spot, expiry)
-                
-                # Simulate outcome (60% win rate for IC)
+            # Trade each day of the week until expiry
+            trading_days = []
+            current_day = week_start
+            while current_day <= expiry and current_day <= end_date:
+                if current_day >= start_date and current_day.weekday() < 5:  # Weekdays only
+                    trading_days.append(current_day)
+                current_day += timedelta(days=1)
+            
+            for trade_date in trading_days:
+                # Random entry time within entry window
                 import random
-                is_winner = random.random() < 0.65
+                entry_h, entry_m = map(int, entry_start.split(':'))
+                end_h, end_m = map(int, entry_end.split(':'))
                 
-                if is_winner:
-                    pnl = trade["credit"] * QUANTITY * 0.5 - CHARGES_PER_LOT  # 50% target
-                    exit_reason = "TARGET"
-                else:
-                    pnl = -trade["credit"] * QUANTITY - CHARGES_PER_LOT  # 100% SL
-                    exit_reason = "STOP_LOSS"
+                # Random entry time between start and 1 hour after start
+                entry_mins = entry_h * 60 + entry_m + random.randint(0, 60)
+                actual_entry_time = f"{entry_mins // 60:02d}:{entry_mins % 60:02d}"
                 
-                trade["pnl"] = pnl
-                trade["exit_reason"] = exit_reason
-                trade["entry_date"] = entry_date.strftime("%Y-%m-%d")
-                trades.append(trade)
-                capital += pnl
-            
-            if strategy in ["straddle", "both"]:
-                trade = self.simulate_straddle(spot, expiry)
+                if strategy in ["iron_condor", "both"]:
+                    trade = self.simulate_iron_condor(
+                        spot, expiry,
+                        IC_CALL_SELL_DISTANCE, IC_CALL_BUY_DISTANCE,
+                        IC_PUT_SELL_DISTANCE, IC_PUT_BUY_DISTANCE
+                    )
+                    
+                    # Simulate intraday exit
+                    exit_result = self.simulate_intraday_exit(
+                        trade["credit"],
+                        IC_TARGET_PERCENT,
+                        IC_STOP_LOSS_PERCENT,
+                        actual_entry_time,
+                        force_exit
+                    )
+                    
+                    # Calculate P&L
+                    if exit_result["exit_reason"] == "TARGET":
+                        pnl = trade["credit"] * QUANTITY * (IC_TARGET_PERCENT / 100) - CHARGES_PER_LOT
+                    elif exit_result["exit_reason"] == "STOP_LOSS":
+                        pnl = -trade["credit"] * QUANTITY * (IC_STOP_LOSS_PERCENT / 100) - CHARGES_PER_LOT
+                    else:  # TIME_EXIT
+                        # Random P&L between -50% and +40%
+                        time_exit_pct = (random.random() - 0.4) * 90
+                        pnl = trade["credit"] * QUANTITY * (time_exit_pct / 100) - CHARGES_PER_LOT
+                    
+                    trade["pnl"] = round(pnl, 2)
+                    trade["exit_reason"] = exit_result["exit_reason"]
+                    trade["entry_date"] = trade_date.strftime("%Y-%m-%d")
+                    trade["entry_time"] = actual_entry_time
+                    trade["exit_time"] = exit_result["exit_time"]
+                    trade["target_pct"] = IC_TARGET_PERCENT
+                    trade["sl_pct"] = IC_STOP_LOSS_PERCENT
+                    trade["quantity"] = QUANTITY
+                    trades.append(trade)
+                    capital += pnl
                 
-                # Simulate outcome (55% win rate for straddle)
-                import random
-                is_winner = random.random() < 0.55
+                if strategy in ["straddle", "both"]:
+                    trade = self.simulate_straddle(spot, expiry)
+                    
+                    # Simulate intraday exit
+                    exit_result = self.simulate_intraday_exit(
+                        trade["total_premium"],
+                        STR_TARGET_PERCENT,
+                        STR_STOP_LOSS_PERCENT,
+                        actual_entry_time,
+                        force_exit
+                    )
+                    
+                    # Calculate P&L
+                    if exit_result["exit_reason"] == "TARGET":
+                        pnl = trade["total_premium"] * QUANTITY * (STR_TARGET_PERCENT / 100) - CHARGES_PER_LOT
+                    elif exit_result["exit_reason"] == "STOP_LOSS":
+                        pnl = -trade["total_premium"] * QUANTITY * (STR_STOP_LOSS_PERCENT / 100) - CHARGES_PER_LOT
+                    else:  # TIME_EXIT
+                        time_exit_pct = (random.random() - 0.4) * 50
+                        pnl = trade["total_premium"] * QUANTITY * (time_exit_pct / 100) - CHARGES_PER_LOT
+                    
+                    trade["pnl"] = round(pnl, 2)
+                    trade["exit_reason"] = exit_result["exit_reason"]
+                    trade["entry_date"] = trade_date.strftime("%Y-%m-%d")
+                    trade["entry_time"] = actual_entry_time
+                    trade["exit_time"] = exit_result["exit_time"]
+                    trade["target_pct"] = STR_TARGET_PERCENT
+                    trade["sl_pct"] = STR_STOP_LOSS_PERCENT
+                    trade["quantity"] = QUANTITY
+                    trades.append(trade)
+                    capital += pnl
                 
-                if is_winner:
-                    pnl = trade["total_premium"] * QUANTITY * 0.3 - CHARGES_PER_LOT  # 30% target
-                    exit_reason = "TARGET"
-                else:
-                    pnl = -trade["total_premium"] * QUANTITY * 0.2 - CHARGES_PER_LOT  # 20% SL
-                    exit_reason = "STOP_LOSS"
-                
-                trade["pnl"] = pnl
-                trade["exit_reason"] = exit_reason
-                trade["entry_date"] = entry_date.strftime("%Y-%m-%d")
-                trades.append(trade)
-                capital += pnl
-            
-            # Update spot with small random walk
-            spot = spot * (1 + (random.random() - 0.5) * 0.02)
+                # Update spot with small random walk
+                spot = spot * (1 + (random.random() - 0.5) * 0.01)
         
         # Calculate stats
         total_trades = len(trades)
         winners = len([t for t in trades if t["pnl"] > 0])
+        losers = len([t for t in trades if t["pnl"] < 0])
         total_pnl = sum(t["pnl"] for t in trades)
+        
+        # Exit reason breakdown
+        target_exits = len([t for t in trades if t["exit_reason"] == "TARGET"])
+        sl_exits = len([t for t in trades if t["exit_reason"] == "STOP_LOSS"])
+        time_exits = len([t for t in trades if t["exit_reason"] == "TIME_EXIT"])
+        
+        # Average times
+        avg_exit_time = "N/A"
+        if trades:
+            exit_mins = []
+            for t in trades:
+                h, m = map(int, t["exit_time"].split(':'))
+                exit_mins.append(h * 60 + m)
+            avg_mins = sum(exit_mins) // len(exit_mins)
+            avg_exit_time = f"{avg_mins // 60:02d}:{avg_mins % 60:02d}"
         
         results = {
             "strategy": strategy,
             "start_date": start_date.strftime("%Y-%m-%d"),
             "end_date": end_date.strftime("%Y-%m-%d"),
+            "entry_time_start": entry_start,
+            "entry_time_end": entry_end,
+            "exit_time": force_exit,
             "expiries_found": len(expiries),
             "total_trades": total_trades,
             "winners": winners,
-            "losers": total_trades - winners,
+            "losers": losers,
             "win_rate": (winners / total_trades * 100) if total_trades > 0 else 0,
-            "total_pnl": total_pnl,
+            "total_pnl": round(total_pnl, 2),
             "initial_capital": initial_capital,
-            "final_capital": capital,
-            "return_pct": ((capital - initial_capital) / initial_capital * 100),
+            "final_capital": round(capital, 2),
+            "return_pct": round((capital - initial_capital) / initial_capital * 100, 2),
+            "exit_breakdown": {
+                "target": target_exits,
+                "stop_loss": sl_exits,
+                "time_exit": time_exits
+            },
+            "avg_exit_time": avg_exit_time,
+            "lot_size": LOT_SIZE,
+            "num_lots": NUM_LOTS,
+            "quantity": QUANTITY,
             "trades": trades
         }
         
@@ -828,6 +967,7 @@ class Backtester:
         save_trade_history(history)
         
         logger.info(f"🔬 Backtest complete: {total_trades} trades, {results['win_rate']:.1f}% win rate, ₹{total_pnl:,.0f} P&L")
+        logger.info(f"📊 Exits: {target_exits} Target, {sl_exits} SL, {time_exits} Time | Avg Exit: {avg_exit_time}")
         
         return results
 
@@ -1609,6 +1749,13 @@ DASHBOARD_HTML = """
         .result-value { font-size: 1.5rem; font-weight: bold; }
         .result-label { font-size: 0.8rem; color: #888; }
         
+        /* Backtest trades table */
+        #bt-trades-body tr:hover { background: rgba(255,255,255,0.05); }
+        #bt-trades-body td { font-size: 0.85rem; }
+        .exit-target { color: #00c853 !important; font-weight: 600; }
+        .exit-sl { color: #ff5252 !important; font-weight: 600; }
+        .exit-time { color: #ff9800 !important; }
+        
         .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
         .tab {
             padding: 10px 20px;
@@ -1873,6 +2020,7 @@ DASHBOARD_HTML = """
         <div class="tab-content" id="tab-backtest">
             <div class="section">
                 <div class="section-title">🔬 Run Backtest</div>
+                <p class="info-text" style="margin-bottom: 15px;">Uses same entry/exit times as live trading bot</p>
                 <div class="backtest-form">
                     <div>
                         <label class="info-text">Start Date</label>
@@ -1894,11 +2042,33 @@ DASHBOARD_HTML = """
                         <label class="info-text">Initial Capital</label>
                         <input type="number" id="bt-capital" value="500000">
                     </div>
+                    <div>
+                        <label class="info-text">Entry Time Start</label>
+                        <input type="time" id="bt-entry-start" value="09:20">
+                    </div>
+                    <div>
+                        <label class="info-text">Entry Time End</label>
+                        <input type="time" id="bt-entry-end" value="14:00">
+                    </div>
+                    <div>
+                        <label class="info-text">Exit Time</label>
+                        <input type="time" id="bt-exit-time" value="15:15">
+                    </div>
                 </div>
-                <button class="btn btn-warning" onclick="runBacktest()">🚀 Run Backtest</button>
+                <button class="btn btn-warning" onclick="runBacktest()" id="bt-run-btn">🚀 Run Backtest</button>
+                <span id="bt-loading" style="display:none; margin-left: 15px;">⏳ Running backtest...</span>
                 
                 <div class="backtest-results" id="bt-results">
                     <h3 style="margin-bottom: 15px;">📊 Backtest Results</h3>
+                    
+                    <!-- Timing Info -->
+                    <div style="background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-bottom: 15px;">
+                        <span class="info-text">⏰ Entry: <strong id="bt-timing-entry">09:20 - 14:00</strong></span>
+                        <span class="info-text" style="margin-left: 20px;">🚪 Exit: <strong id="bt-timing-exit">15:15</strong></span>
+                        <span class="info-text" style="margin-left: 20px;">📦 Qty: <strong id="bt-timing-qty">75</strong></span>
+                    </div>
+                    
+                    <!-- Summary Grid -->
                     <div class="result-grid">
                         <div class="result-item">
                             <div class="result-value" id="bt-trades">0</div>
@@ -1918,7 +2088,53 @@ DASHBOARD_HTML = """
                         </div>
                         <div class="result-item">
                             <div class="result-value" id="bt-expiries">0</div>
-                            <div class="result-label">Expiries Found</div>
+                            <div class="result-label">Expiries</div>
+                        </div>
+                        <div class="result-item">
+                            <div class="result-value" id="bt-avg-exit">--:--</div>
+                            <div class="result-label">Avg Exit Time</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Exit Breakdown -->
+                    <div style="margin-top: 20px;">
+                        <h4 style="margin-bottom: 10px; color: #00d2ff;">📈 Exit Breakdown</h4>
+                        <div class="result-grid" style="grid-template-columns: repeat(3, 1fr);">
+                            <div class="result-item">
+                                <div class="result-value positive" id="bt-target-exits">0</div>
+                                <div class="result-label">🎯 Target Hits</div>
+                            </div>
+                            <div class="result-item">
+                                <div class="result-value negative" id="bt-sl-exits">0</div>
+                                <div class="result-label">🛑 Stop Loss</div>
+                            </div>
+                            <div class="result-item">
+                                <div class="result-value" id="bt-time-exits">0</div>
+                                <div class="result-label">⏰ Time Exits</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Trades Table -->
+                    <div style="margin-top: 20px;">
+                        <h4 style="margin-bottom: 10px; color: #00d2ff;">📋 Trade Details <span class="info-text" id="bt-trade-count">(0 trades)</span></h4>
+                        <div style="max-height: 400px; overflow-y: auto;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Date</th>
+                                        <th>Strategy</th>
+                                        <th>Entry Time</th>
+                                        <th>Exit Time</th>
+                                        <th>Premium</th>
+                                        <th>P&L</th>
+                                        <th>Exit Reason</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="bt-trades-body">
+                                    <tr><td colspan="7" style="text-align:center;color:#666;">Run backtest to see trades</td></tr>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
@@ -2306,26 +2522,83 @@ DASHBOARD_HTML = """
             const end = document.getElementById('bt-end').value;
             const strategy = document.getElementById('bt-strategy').value;
             const capital = document.getElementById('bt-capital').value;
+            const entryStart = document.getElementById('bt-entry-start').value;
+            const entryEnd = document.getElementById('bt-entry-end').value;
+            const exitTime = document.getElementById('bt-exit-time').value;
+            
+            // Show loading
+            document.getElementById('bt-run-btn').disabled = true;
+            document.getElementById('bt-loading').style.display = 'inline';
             
             try {
                 const res = await fetch('/api/backtest', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ start_date: start, end_date: end, strategy, capital: parseFloat(capital) })
+                    body: JSON.stringify({ 
+                        start_date: start, 
+                        end_date: end, 
+                        strategy, 
+                        capital: parseFloat(capital),
+                        entry_time_start: entryStart,
+                        entry_time_end: entryEnd,
+                        exit_time: exitTime
+                    })
                 });
                 const data = await res.json();
                 
+                // Summary stats
                 document.getElementById('bt-trades').textContent = data.total_trades || 0;
                 document.getElementById('bt-winrate').textContent = (data.win_rate || 0).toFixed(1) + '%';
                 document.getElementById('bt-pnl').textContent = '₹' + (data.total_pnl || 0).toLocaleString('en-IN');
                 document.getElementById('bt-pnl').className = 'result-value ' + ((data.total_pnl || 0) >= 0 ? 'positive' : 'negative');
                 document.getElementById('bt-return').textContent = (data.return_pct || 0).toFixed(2) + '%';
                 document.getElementById('bt-expiries').textContent = data.expiries_found || 0;
+                document.getElementById('bt-avg-exit').textContent = data.avg_exit_time || '--:--';
+                
+                // Timing info
+                document.getElementById('bt-timing-entry').textContent = (data.entry_time_start || entryStart) + ' - ' + (data.entry_time_end || entryEnd);
+                document.getElementById('bt-timing-exit').textContent = data.exit_time || exitTime;
+                document.getElementById('bt-timing-qty').textContent = data.quantity || 75;
+                
+                // Exit breakdown
+                const exits = data.exit_breakdown || {};
+                document.getElementById('bt-target-exits').textContent = exits.target || 0;
+                document.getElementById('bt-sl-exits').textContent = exits.stop_loss || 0;
+                document.getElementById('bt-time-exits').textContent = exits.time_exit || 0;
+                
+                // Trades table
+                const trades = data.trades || [];
+                document.getElementById('bt-trade-count').textContent = '(' + trades.length + ' trades)';
+                
+                const tbody = document.getElementById('bt-trades-body');
+                if (!trades.length) {
+                    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#666;">No trades</td></tr>';
+                } else {
+                    tbody.innerHTML = trades.map(t => {
+                        const pnl = parseFloat(t.pnl || 0);
+                        const premium = t.credit || t.total_premium || 0;
+                        const strategyName = (t.strategy || '').replace('_', ' ');
+                        const exitClass = t.exit_reason === 'TARGET' ? 'positive' : 
+                                         t.exit_reason === 'STOP_LOSS' ? 'negative' : '';
+                        return `<tr>
+                            <td>${t.entry_date || '-'}</td>
+                            <td>${strategyName}</td>
+                            <td>${t.entry_time || '-'}</td>
+                            <td>${t.exit_time || '-'}</td>
+                            <td>₹${parseFloat(premium).toFixed(0)}</td>
+                            <td class="${pnl >= 0 ? 'positive' : 'negative'}">₹${pnl.toLocaleString('en-IN', {maximumFractionDigits: 0})}</td>
+                            <td class="${exitClass}">${t.exit_reason || '-'}</td>
+                        </tr>`;
+                    }).join('');
+                }
                 
                 document.getElementById('bt-results').classList.add('show');
             } catch (e) {
                 console.error(e);
                 alert('Backtest failed: ' + e.message);
+            } finally {
+                document.getElementById('bt-run-btn').disabled = false;
+                document.getElementById('bt-loading').style.display = 'none';
             }
         }
         
@@ -2357,8 +2630,29 @@ DASHBOARD_HTML = """
             }
         }
         
+        async function initBacktestForm() {
+            // Load bot settings to populate backtest form with same values
+            try {
+                const res = await fetch('/api/status');
+                const status = await res.json();
+                
+                if (status.entry_time_start) {
+                    document.getElementById('bt-entry-start').value = status.entry_time_start;
+                }
+                if (status.entry_time_end) {
+                    document.getElementById('bt-entry-end').value = status.entry_time_end;
+                }
+                if (status.exit_time) {
+                    document.getElementById('bt-exit-time').value = status.exit_time;
+                }
+            } catch (e) {
+                console.error('Error loading bot settings for backtest:', e);
+            }
+        }
+        
         initChart();
         refreshData();
+        initBacktestForm();
         setInterval(refreshData, 15000);  // Refresh every 15 seconds to reduce API load
     </script>
 </body>
@@ -2491,7 +2785,7 @@ def api_bot_stop():
 
 @app.route('/api/backtest', methods=['POST'])
 def api_backtest():
-    """Run backtest via API"""
+    """Run backtest via API with entry/exit time configuration"""
     try:
         req = request.json
         start_date = datetime.strptime(req.get("start_date", "2025-01-01"), "%Y-%m-%d")
@@ -2499,12 +2793,24 @@ def api_backtest():
         strategy = req.get("strategy", "iron_condor")
         capital = float(req.get("capital", 500000))
         
+        # Get timing parameters (use bot defaults if not provided)
+        entry_time_start = req.get("entry_time_start", ENTRY_TIME_START)
+        entry_time_end = req.get("entry_time_end", ENTRY_TIME_END)
+        exit_time = req.get("exit_time", EXIT_TIME)
+        
         backtester = Backtester()
-        results = backtester.run_backtest(start_date, end_date, strategy, capital)
+        results = backtester.run_backtest(
+            start_date, end_date, strategy, capital,
+            entry_time_start=entry_time_start,
+            entry_time_end=entry_time_end,
+            exit_time=exit_time
+        )
         
         return jsonify(results)
     except Exception as e:
         logger.error(f"Backtest error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/expiries', methods=['GET'])

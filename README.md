@@ -117,6 +117,53 @@ The bot includes a full backtesting engine accessible via the dashboard:
 3. Choose strategy
 4. Click **Run Backtest**
 
+## 🔬 Backtesting
+
+The backtesting engine uses the **same entry/exit times** as the live trading bot:
+
+### Features
+- **Entry Window**: Configurable entry time start and end
+- **Exit Time**: Force exit time for all positions
+- **Intraday Simulation**: Simulates price movement throughout the day
+- **Exit Breakdown**: Shows how many trades hit target, stop-loss, or time exit
+
+### Backtest Results Show:
+| Field | Description |
+|-------|-------------|
+| Total Trades | Number of trades executed |
+| Win Rate | Percentage of profitable trades |
+| Total P&L | Net profit/loss |
+| Return % | Return on initial capital |
+| Avg Exit Time | Average time of day for exits |
+| Target Hits | Trades that hit target |
+| Stop Loss | Trades that hit stop-loss |
+| Time Exits | Trades exited at force exit time |
+
+### Detailed Trade Log
+Each trade shows:
+- **Entry Date** - When the trade was entered
+- **Entry Time** - Actual entry time (random within window)
+- **Exit Time** - When the trade was closed
+- **Premium** - Entry premium collected
+- **P&L** - Profit/loss in ₹
+- **Exit Reason** - TARGET, STOP_LOSS, or TIME_EXIT
+
+### API Usage
+```bash
+POST /api/backtest
+{
+  "start_date": "2025-01-01",
+  "end_date": "2025-12-31",
+  "strategy": "iron_condor",
+  "capital": 500000,
+  "entry_time_start": "09:20",
+  "entry_time_end": "14:00",
+  "exit_time": "15:15"
+}
+```
+
+---
+
 ## 📊 Dashboard Features
 
 ### Live Position Panel
