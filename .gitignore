@@ -16,3 +16,4 @@ bot_data.json
 # OS
 .DS_Store
 Thumbs.db
+settings.py

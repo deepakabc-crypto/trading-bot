@@ -4,8 +4,8 @@
 Backtest Iron Condor & Short Straddle strategies using ICICI Breeze historical data.
 
 Setup:
-    1. Copy .env.example to .env and fill in your credentials & settings
-    2. pip install breeze-connect python-dotenv pandas
+    1. Edit settings.py with your API credentials & strategy parameters
+    2. pip install breeze-connect pandas
 
 Usage:
     python backtest.py --strategy iron_condor --from 2024-01-01 --to 2024-12-31
@@ -14,11 +14,9 @@ Usage:
     python backtest.py --simulate  # No API credentials needed
 
 Configuration:
-    All settings (API keys, strategy params, capital) are loaded from .env file.
-    See .env.example for all available options.
+    All settings are in settings.py — API keys, strategy params, capital, costs.
 """
 
-import os
 import json
 import csv
 import argparse
@@ -28,12 +26,7 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 
-# Load .env file if present
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv not installed, rely on OS env vars
+import settings
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -305,25 +298,25 @@ class SimulatedDataFetcher:
 class StrategyEngine:
     """Core strategy logic for Iron Condor and Short Straddle."""
 
-    # Settings loaded from .env / environment variables
+    # Settings loaded from settings.py
     IC_CONFIG = {
-        "lot_size": int(os.getenv("IC_LOT_SIZE", 65)),
-        "lots": int(os.getenv("IC_LOTS", 1)),
-        "sell_offset": int(os.getenv("IC_SELL_OFFSET", 150)),
-        "buy_offset": int(os.getenv("IC_BUY_OFFSET", 250)),
-        "target_pct": float(os.getenv("IC_TARGET_PCT", 0.50)),
-        "stoploss_pct": float(os.getenv("IC_STOPLOSS_PCT", 1.00)),
+        "lot_size": settings.IC_LOT_SIZE,
+        "lots": settings.IC_LOTS,
+        "sell_offset": settings.IC_SELL_OFFSET,
+        "buy_offset": settings.IC_BUY_OFFSET,
+        "target_pct": settings.IC_TARGET_PCT,
+        "stoploss_pct": settings.IC_STOPLOSS_PCT,
     }
 
     SS_CONFIG = {
-        "lot_size": int(os.getenv("SS_LOT_SIZE", 65)),
-        "lots": int(os.getenv("SS_LOTS", 1)),
-        "target_pct": float(os.getenv("SS_TARGET_PCT", 0.30)),
-        "stoploss_pct": float(os.getenv("SS_STOPLOSS_PCT", 0.20)),
+        "lot_size": settings.SS_LOT_SIZE,
+        "lots": settings.SS_LOTS,
+        "target_pct": settings.SS_TARGET_PCT,
+        "stoploss_pct": settings.SS_STOPLOSS_PCT,
     }
 
-    SLIPPAGE_PER_LOT = float(os.getenv("SLIPPAGE_PER_LOT", 0.5))
-    BROKERAGE_PER_ORDER = float(os.getenv("BROKERAGE_PER_ORDER", 20))
+    SLIPPAGE_PER_LOT = settings.SLIPPAGE_PER_LOT
+    BROKERAGE_PER_ORDER = settings.BROKERAGE_PER_ORDER
 
     @staticmethod
     def round_strike(spot: float, base: int = 50) -> float:
@@ -731,20 +724,26 @@ def print_report(result: BacktestResult):
 def main():
     parser = argparse.ArgumentParser(description="Nifty Options Backtester")
     parser.add_argument("--strategy", choices=["iron_condor", "short_straddle", "both"],
-                        default=os.getenv("STRATEGY", "iron_condor"), help="Strategy to backtest")
+                        default=settings.STRATEGY, help="Strategy to backtest")
     parser.add_argument("--from", dest="from_date", default="2024-01-01", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--to", dest="to_date", default="2024-12-31", help="End date (YYYY-MM-DD)")
-    parser.add_argument("--capital", type=float, default=float(os.getenv("CAPITAL", 500_000)),
+    parser.add_argument("--capital", type=float, default=settings.CAPITAL,
                         help="Initial capital (₹)")
     parser.add_argument("--simulate", action="store_true", help="Use simulated data (no API needed)")
     args = parser.parse_args()
 
     # Initialize data fetcher
-    api_key = os.getenv("API_KEY", "")
-    api_secret = os.getenv("API_SECRET", "")
-    session_token = os.getenv("SESSION_TOKEN", "")
+    api_key = settings.API_KEY
+    api_secret = settings.API_SECRET
+    session_token = settings.SESSION_TOKEN
 
-    if not args.simulate and api_key and api_secret and session_token:
+    has_credentials = (
+        api_key and api_key != "your_api_key_here"
+        and api_secret and api_secret != "your_api_secret_here"
+        and session_token and session_token != "your_session_token_here"
+    )
+
+    if not args.simulate and has_credentials:
         try:
             fetcher = BreezeDataFetcher(api_key, api_secret, session_token)
         except Exception as e:
@@ -752,7 +751,7 @@ def main():
             fetcher = SimulatedDataFetcher()
     else:
         if not args.simulate:
-            log.info("ℹ️  No API credentials found. Use --simulate or set API_KEY, API_SECRET, SESSION_TOKEN")
+            log.info("ℹ️  No API credentials found. Use --simulate or update settings.py")
         fetcher = SimulatedDataFetcher()
 
     strategies = (
