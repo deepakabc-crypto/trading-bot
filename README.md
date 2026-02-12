@@ -37,10 +37,13 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 |----------|-------------|---------|
 | `API_KEY` | ICICI Breeze API Key | abc123... |
 | `API_SECRET` | ICICI Breeze Secret | xyz789... |
+| `API_SESSION` | Breeze Session Token (daily) | abc123xyz... |
 | `TELEGRAM_BOT_TOKEN` | From @BotFather | 123456:ABC... |
 | `TELEGRAM_CHAT_ID` | Your chat ID | 987654321 |
 | `CAPITAL` | Trading capital | 500000 |
 | `STRATEGY` | Default strategy | iron_condor |
+
+> **Note:** `API_SESSION` expires daily. You can update it via Telegram `/session TOKEN` or the dashboard.
 
 ### Step 4: Generate Domain
 1. Settings → Public Networking

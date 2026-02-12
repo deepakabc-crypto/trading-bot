@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ============================================
 API_KEY = os.environ.get("API_KEY", "")
 API_SECRET = os.environ.get("API_SECRET", "")
-API_SESSION = os.environ.get("API_SESSION", "")
+API_SESSION = os.environ.get("API_SESSION", "") or os.environ.get("SESSION_TOKEN", "")  # Breeze session token
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL = int(os.environ.get("CAPITAL", "500000"))
