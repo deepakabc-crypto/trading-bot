@@ -117,6 +117,21 @@ The bot includes a full backtesting engine accessible via the dashboard:
 3. Choose strategy
 4. Click **Run Backtest**
 
+## 📊 Dashboard Features
+
+### Live Position Panel
+- **Real-time P&L** - Updates every 5 seconds
+- **Position Details** - Entry time, spot price, expiry, quantity
+- **Leg-wise Breakdown** - See each option leg with entry/current prices
+- **Progress Bar** - Visual indicator showing distance to target/stop-loss
+- **Unrealized P&L** - Both absolute value and percentage
+
+### Status Badges
+- 🕐 Current IST time
+- 📊 Market status (OPEN/CLOSED)
+- ⏳ Entry window status
+- 📅 Next expiry date
+
 ### API Endpoints for Backtesting
 
 ```bash
@@ -137,6 +152,14 @@ GET /api/status
 
 # Get current settings
 GET /api/settings
+
+# Get live positions
+GET /api/position
+
+# Get real-time P&L for positions
+GET /api/live_pnl?strategy=iron_condor
+GET /api/live_pnl?strategy=straddle
+GET /api/live_pnl?strategy=all
 ```
 
 ### Example Status Response

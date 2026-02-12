@@ -99,6 +99,7 @@ def get_ist_now():
 # ============================================
 DATA_FILE = "bot_data.json"
 TRADE_HISTORY_FILE = "trade_history.json"
+POSITION_FILE = "live_position.json"
 
 def load_data():
     try:
@@ -124,6 +125,29 @@ def save_data(data):
             json.dump(data, f, indent=2)
     except Exception as e:
         logger.error(f"Save error: {e}")
+
+def load_position():
+    """Load current live position"""
+    try:
+        if os.path.exists(POSITION_FILE):
+            with open(POSITION_FILE, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return {
+        "iron_condor": None,
+        "straddle": None,
+        "last_update": ""
+    }
+
+def save_position(position_data):
+    """Save current live position"""
+    try:
+        position_data["last_update"] = datetime.now().isoformat()
+        with open(POSITION_FILE, 'w') as f:
+            json.dump(position_data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Save position error: {e}")
 
 def load_trade_history():
     """Load persistent trade history"""
@@ -735,6 +759,9 @@ class IronCondor:
         self.api = api
         self.position = None
         self.entry_premium = 0
+        self.entry_prices = {}
+        self.entry_time = None
+        self.spot_at_entry = None
         
     def enter(self, spot, expiry):
         atm = round(spot / 50) * 50
@@ -783,32 +810,88 @@ class IronCondor:
         self.api.place_order(sp, "put", expiry, QUANTITY, "sell", sp_p)
         self.api.place_order(bp, "put", expiry, QUANTITY, "buy", bp_p)
         
-        self.position = {"sc": sc, "bc": bc, "sp": sp, "bp": bp, "expiry": expiry}
+        # Store position details
+        expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
+        self.position = {"sc": sc, "bc": bc, "sp": sp, "bp": bp, "expiry": expiry, "expiry_str": expiry_str}
         self.entry_premium = credit
+        self.entry_prices = {"sc": sc_p, "bc": bc_p, "sp": sp_p, "bp": bp_p}
+        self.entry_time = datetime.now().isoformat()
+        self.spot_at_entry = spot
+        
+        # Save to file for dashboard
+        self._save_position()
         
         telegram.send(f"🦅 <b>Iron Condor Entry</b>\nSpot: {spot}\nATM: {atm}\nSell: {sc}CE @ {sc_p:.0f} / {sp}PE @ {sp_p:.0f}\nBuy: {bc}CE @ {bc_p:.0f} / {bp}PE @ {bp_p:.0f}\nCredit: ₹{credit:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
         return True
+    
+    def _save_position(self):
+        """Save position to file for dashboard"""
+        pos_data = load_position()
+        if self.position:
+            pos_data["iron_condor"] = {
+                "strategy": "IRON_CONDOR",
+                "strikes": {
+                    "sell_call": self.position["sc"],
+                    "buy_call": self.position["bc"],
+                    "sell_put": self.position["sp"],
+                    "buy_put": self.position["bp"]
+                },
+                "entry_prices": self.entry_prices,
+                "entry_premium": self.entry_premium,
+                "entry_time": self.entry_time,
+                "spot_at_entry": self.spot_at_entry,
+                "expiry": self.position.get("expiry_str", ""),
+                "quantity": QUANTITY,
+                "num_lots": NUM_LOTS
+            }
+        else:
+            pos_data["iron_condor"] = None
+        save_position(pos_data)
+    
+    def get_live_pnl(self):
+        """Get current unrealized P&L"""
+        if not self.position:
+            return None
+        
+        sc = self.api.get_ltp(self.position["sc"], "call", self.position["expiry"]) or self.entry_prices.get("sc", 0)
+        bc = self.api.get_ltp(self.position["bc"], "call", self.position["expiry"]) or self.entry_prices.get("bc", 0)
+        sp = self.api.get_ltp(self.position["sp"], "put", self.position["expiry"]) or self.entry_prices.get("sp", 0)
+        bp = self.api.get_ltp(self.position["bp"], "put", self.position["expiry"]) or self.entry_prices.get("bp", 0)
+        
+        current_premium = (sc - bc) + (sp - bp)
+        pnl_points = self.entry_premium - current_premium
+        pnl_amount = pnl_points * QUANTITY
+        pnl_pct = (pnl_points / self.entry_premium * 100) if self.entry_premium > 0 else 0
+        
+        return {
+            "current_prices": {"sc": sc, "bc": bc, "sp": sp, "bp": bp},
+            "current_premium": current_premium,
+            "entry_premium": self.entry_premium,
+            "pnl_points": pnl_points,
+            "pnl_amount": pnl_amount,
+            "pnl_percent": pnl_pct,
+            "target_pct": IC_TARGET_PERCENT,
+            "stoploss_pct": IC_STOP_LOSS_PERCENT
+        }
     
     def check_exit(self):
         if not self.position:
             return None
         
-        sc = self.api.get_ltp(self.position["sc"], "call", self.position["expiry"]) or 0
-        bc = self.api.get_ltp(self.position["bc"], "call", self.position["expiry"]) or 0
-        sp = self.api.get_ltp(self.position["sp"], "put", self.position["expiry"]) or 0
-        bp = self.api.get_ltp(self.position["bp"], "put", self.position["expiry"]) or 0
+        pnl_data = self.get_live_pnl()
+        if not pnl_data:
+            return None
         
-        current = (sc - bc) + (sp - bp)
-        pnl_pct = (self.entry_premium - current) / self.entry_premium * 100 if self.entry_premium > 0 else 0
+        pnl_pct = pnl_data["pnl_percent"]
         
         if pnl_pct >= IC_TARGET_PERCENT:
             return "TARGET"
         if pnl_pct <= -IC_STOP_LOSS_PERCENT:
             return "STOP_LOSS"
         
-        now = datetime.now()
-        exit_t = datetime.strptime(EXIT_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-        if now >= exit_t:
+        now = get_ist_now()
+        current_time = now.strftime("%H:%M")
+        if current_time >= EXIT_TIME:
             return "TIME_EXIT"
         return None
     
@@ -842,6 +925,8 @@ class IronCondor:
         logger.info(f"🦅 IC Exit: {reason}, P&L: {pnl}")
         
         self.position = None
+        self.entry_prices = {}
+        self._save_position()  # Clear position from file
         return pnl
 
 # ============================================
@@ -852,6 +937,9 @@ class ShortStraddle:
         self.api = api
         self.position = None
         self.entry_premium = 0
+        self.entry_prices = {}
+        self.entry_time = None
+        self.spot_at_entry = None
         
     def enter(self, spot, expiry):
         atm = round(spot / 50) * 50
@@ -886,30 +974,81 @@ class ShortStraddle:
         self.api.place_order(atm, "call", expiry, QUANTITY, "sell", ce)
         self.api.place_order(atm, "put", expiry, QUANTITY, "sell", pe)
         
-        self.position = {"strike": atm, "expiry": expiry}
+        # Store position details
+        expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
+        self.position = {"strike": atm, "expiry": expiry, "expiry_str": expiry_str}
         self.entry_premium = total
+        self.entry_prices = {"ce": ce, "pe": pe}
+        self.entry_time = datetime.now().isoformat()
+        self.spot_at_entry = spot
+        
+        # Save to file for dashboard
+        self._save_position()
         
         telegram.send(f"📊 <b>Straddle Entry</b>\nSpot: {spot}\nStrike: {atm}\nCE: ₹{ce:.0f} / PE: ₹{pe:.0f}\nTotal Premium: ₹{total:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
         return True
+    
+    def _save_position(self):
+        """Save position to file for dashboard"""
+        pos_data = load_position()
+        if self.position:
+            pos_data["straddle"] = {
+                "strategy": "SHORT_STRADDLE",
+                "strike": self.position["strike"],
+                "entry_prices": self.entry_prices,
+                "entry_premium": self.entry_premium,
+                "entry_time": self.entry_time,
+                "spot_at_entry": self.spot_at_entry,
+                "expiry": self.position.get("expiry_str", ""),
+                "quantity": QUANTITY,
+                "num_lots": NUM_LOTS
+            }
+        else:
+            pos_data["straddle"] = None
+        save_position(pos_data)
+    
+    def get_live_pnl(self):
+        """Get current unrealized P&L"""
+        if not self.position:
+            return None
+        
+        ce = self.api.get_ltp(self.position["strike"], "call", self.position["expiry"]) or self.entry_prices.get("ce", 0)
+        pe = self.api.get_ltp(self.position["strike"], "put", self.position["expiry"]) or self.entry_prices.get("pe", 0)
+        
+        current_premium = ce + pe
+        pnl_points = self.entry_premium - current_premium
+        pnl_amount = pnl_points * QUANTITY
+        pnl_pct = (pnl_points / self.entry_premium * 100) if self.entry_premium > 0 else 0
+        
+        return {
+            "current_prices": {"ce": ce, "pe": pe},
+            "current_premium": current_premium,
+            "entry_premium": self.entry_premium,
+            "pnl_points": pnl_points,
+            "pnl_amount": pnl_amount,
+            "pnl_percent": pnl_pct,
+            "target_pct": STR_TARGET_PERCENT,
+            "stoploss_pct": STR_STOP_LOSS_PERCENT
+        }
     
     def check_exit(self):
         if not self.position:
             return None
         
-        ce = self.api.get_ltp(self.position["strike"], "call", self.position["expiry"]) or 0
-        pe = self.api.get_ltp(self.position["strike"], "put", self.position["expiry"]) or 0
-        current = ce + pe
+        pnl_data = self.get_live_pnl()
+        if not pnl_data:
+            return None
         
-        pnl_pct = (self.entry_premium - current) / self.entry_premium * 100 if self.entry_premium > 0 else 0
+        pnl_pct = pnl_data["pnl_percent"]
         
         if pnl_pct >= STR_TARGET_PERCENT:
             return "TARGET"
         if pnl_pct <= -STR_STOP_LOSS_PERCENT:
             return "STOP_LOSS"
         
-        now = datetime.now()
-        exit_t = datetime.strptime(EXIT_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-        if now >= exit_t:
+        now = get_ist_now()
+        current_time = now.strftime("%H:%M")
+        if current_time >= EXIT_TIME:
             return "TIME_EXIT"
         return None
     
@@ -939,6 +1078,8 @@ class ShortStraddle:
         logger.info(f"📊 Straddle Exit: {reason}, P&L: {pnl}")
         
         self.position = None
+        self.entry_prices = {}
+        self._save_position()  # Clear position from file
         return pnl
 
 # ============================================
@@ -976,6 +1117,8 @@ def is_market_hours():
     return "09:15" <= current_time <= "15:30"
 
 def bot_thread():
+    global _live_ic, _live_straddle
+    
     logger.info("🤖 Bot thread starting...")
     logger.info(f"⏰ Entry Time: {ENTRY_TIME_START} - {ENTRY_TIME_END} IST")
     logger.info(f"⏰ Exit Time: {EXIT_TIME} IST")
@@ -1002,6 +1145,11 @@ def bot_thread():
     api = BreezeAPI()
     ic = IronCondor(api)
     straddle = ShortStraddle(api)
+    
+    # Set global references for live P&L API
+    _live_ic = ic
+    _live_straddle = straddle
+    
     last_connect = datetime.now() - timedelta(hours=1)
     last_status_log = datetime.now() - timedelta(minutes=5)
     last_trade_date = None
@@ -1171,6 +1319,138 @@ DASHBOARD_HTML = """
         .positive { color: #00c853; }
         .negative { color: #ff5252; }
         
+        /* Live Position Styles */
+        .position-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 15px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .position-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .position-strategy {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #00d2ff;
+        }
+        .position-pnl {
+            font-size: 1.4rem;
+            font-weight: 700;
+        }
+        .position-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .position-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            color: #aaa;
+        }
+        .position-row span:last-child {
+            color: #fff;
+            font-weight: 500;
+        }
+        .position-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+        .position-table th {
+            background: rgba(255,255,255,0.05);
+            padding: 10px;
+            text-align: left;
+            color: #888;
+            font-weight: 500;
+        }
+        .position-table td {
+            padding: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .position-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 15px;
+            padding: 15px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        .summary-item {
+            text-align: center;
+        }
+        .summary-item span:first-child {
+            display: block;
+            font-size: 0.75rem;
+            color: #888;
+            margin-bottom: 5px;
+        }
+        .summary-item span:last-child {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+        .pnl-value.positive { color: #00c853; }
+        .pnl-value.negative { color: #ff5252; }
+        
+        .position-progress {
+            margin-top: 15px;
+        }
+        .progress-bar {
+            position: relative;
+            height: 24px;
+            background: linear-gradient(90deg, #ff5252 0%, #ff5252 33%, #333 33%, #333 67%, #00c853 67%, #00c853 100%);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: 4px;
+            height: 100%;
+            background: #fff;
+            border-radius: 2px;
+            transition: left 0.3s ease;
+        }
+        .progress-markers {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 10px;
+            font-size: 0.7rem;
+            color: rgba(255,255,255,0.7);
+        }
+        .progress-labels {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 5px;
+            font-size: 0.75rem;
+            color: #888;
+        }
+        .no-position {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        .no-position p:first-child {
+            font-size: 1.2rem;
+            margin-bottom: 10px;
+        }
+        
         .section {
             background: rgba(255,255,255,0.03);
             border-radius: 15px;
@@ -1304,6 +1584,152 @@ DASHBOARD_HTML = """
                 <div class="card">
                     <div class="card-label">Portfolio Value</div>
                     <div class="card-value" id="portfolio">₹5,00,000</div>
+                </div>
+            </div>
+            
+            <!-- LIVE POSITION SECTION -->
+            <div class="section" id="position-section" style="display: none;">
+                <div class="section-title">📍 Live Position</div>
+                <div id="position-container">
+                    <!-- Iron Condor Position -->
+                    <div id="ic-position" class="position-card" style="display: none;">
+                        <div class="position-header">
+                            <span class="position-strategy">🦅 IRON CONDOR</span>
+                            <span class="position-pnl" id="ic-pnl">₹0</span>
+                        </div>
+                        <div class="position-details">
+                            <div class="position-row">
+                                <span>Entry Time:</span>
+                                <span id="ic-entry-time">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Spot at Entry:</span>
+                                <span id="ic-spot-entry">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Expiry:</span>
+                                <span id="ic-expiry">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Quantity:</span>
+                                <span id="ic-qty">--</span>
+                            </div>
+                        </div>
+                        <table class="position-table">
+                            <thead>
+                                <tr><th>Leg</th><th>Strike</th><th>Entry</th><th>Current</th><th>P&L</th></tr>
+                            </thead>
+                            <tbody id="ic-legs">
+                            </tbody>
+                        </table>
+                        <div class="position-summary">
+                            <div class="summary-item">
+                                <span>Entry Credit:</span>
+                                <span id="ic-entry-credit">₹0</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Current Premium:</span>
+                                <span id="ic-current-premium">₹0</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Unrealized P&L:</span>
+                                <span id="ic-unrealized-pnl" class="pnl-value">₹0</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>P&L %:</span>
+                                <span id="ic-pnl-pct">0%</span>
+                            </div>
+                        </div>
+                        <div class="position-progress">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="ic-progress"></div>
+                                <div class="progress-markers">
+                                    <span class="marker marker-sl">SL</span>
+                                    <span class="marker marker-entry">Entry</span>
+                                    <span class="marker marker-target">Target</span>
+                                </div>
+                            </div>
+                            <div class="progress-labels">
+                                <span id="ic-sl-label">-100%</span>
+                                <span id="ic-target-label">+50%</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Straddle Position -->
+                    <div id="str-position" class="position-card" style="display: none;">
+                        <div class="position-header">
+                            <span class="position-strategy">📊 SHORT STRADDLE</span>
+                            <span class="position-pnl" id="str-pnl">₹0</span>
+                        </div>
+                        <div class="position-details">
+                            <div class="position-row">
+                                <span>Entry Time:</span>
+                                <span id="str-entry-time">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Strike:</span>
+                                <span id="str-strike">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Spot at Entry:</span>
+                                <span id="str-spot-entry">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Expiry:</span>
+                                <span id="str-expiry">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Quantity:</span>
+                                <span id="str-qty">--</span>
+                            </div>
+                        </div>
+                        <table class="position-table">
+                            <thead>
+                                <tr><th>Leg</th><th>Entry</th><th>Current</th><th>P&L</th></tr>
+                            </thead>
+                            <tbody id="str-legs">
+                            </tbody>
+                        </table>
+                        <div class="position-summary">
+                            <div class="summary-item">
+                                <span>Entry Premium:</span>
+                                <span id="str-entry-premium">₹0</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Current Premium:</span>
+                                <span id="str-current-premium">₹0</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Unrealized P&L:</span>
+                                <span id="str-unrealized-pnl" class="pnl-value">₹0</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>P&L %:</span>
+                                <span id="str-pnl-pct">0%</span>
+                            </div>
+                        </div>
+                        <div class="position-progress">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="str-progress"></div>
+                                <div class="progress-markers">
+                                    <span class="marker marker-sl">SL</span>
+                                    <span class="marker marker-entry">Entry</span>
+                                    <span class="marker marker-target">Target</span>
+                                </div>
+                            </div>
+                            <div class="progress-labels">
+                                <span id="str-sl-label">-20%</span>
+                                <span id="str-target-label">+30%</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- No Position -->
+                    <div id="no-position" class="no-position">
+                        <p>📭 No active positions</p>
+                        <p class="info-text">Positions will appear here when the bot takes a trade</p>
+                    </div>
                 </div>
             </div>
             
@@ -1533,11 +1959,215 @@ DASHBOARD_HTML = """
                     ' | Min Premium: ₹' + status.min_premium + 
                     ' | Market: 9:15 AM - 3:30 PM IST';
                 
+                // Fetch and update live positions
+                const posRes = await fetch('/api/position');
+                const posData = await posRes.json();
+                updatePositions(posData);
+                
                 const tradesRes = await fetch('/api/trades');
                 const trades = await tradesRes.json();
                 updateTable(trades);
                 updateChart(trades);
             } catch (e) { console.error(e); }
+        }
+        
+        function updatePositions(posData) {
+            const section = document.getElementById('position-section');
+            const icPos = document.getElementById('ic-position');
+            const strPos = document.getElementById('str-position');
+            const noPos = document.getElementById('no-position');
+            
+            // Always show position section
+            section.style.display = 'block';
+            
+            if (!posData.has_position) {
+                icPos.style.display = 'none';
+                strPos.style.display = 'none';
+                noPos.style.display = 'block';
+                return;
+            }
+            
+            noPos.style.display = 'none';
+            
+            // Iron Condor Position
+            if (posData.iron_condor) {
+                icPos.style.display = 'block';
+                const ic = posData.iron_condor;
+                
+                // Entry details
+                document.getElementById('ic-entry-time').textContent = ic.entry_time ? new Date(ic.entry_time).toLocaleTimeString('en-IN') : '--';
+                document.getElementById('ic-spot-entry').textContent = ic.spot_at_entry ? ic.spot_at_entry.toFixed(2) : '--';
+                document.getElementById('ic-expiry').textContent = ic.expiry || '--';
+                document.getElementById('ic-qty').textContent = ic.quantity + ' (' + ic.num_lots + ' lots)';
+                
+                // Calculate P&L from entry prices (static display)
+                const entryCredit = ic.entry_premium || 0;
+                document.getElementById('ic-entry-credit').textContent = '₹' + entryCredit.toFixed(2);
+                
+                // Legs table
+                const strikes = ic.strikes || {};
+                const entryPrices = ic.entry_prices || {};
+                document.getElementById('ic-legs').innerHTML = `
+                    <tr>
+                        <td style="color:#ff5252;">SELL CALL</td>
+                        <td>${strikes.sell_call || '--'}</td>
+                        <td>₹${(entryPrices.sc || 0).toFixed(2)}</td>
+                        <td id="ic-sc-ltp">--</td>
+                        <td id="ic-sc-pnl">--</td>
+                    </tr>
+                    <tr>
+                        <td style="color:#00c853;">BUY CALL</td>
+                        <td>${strikes.buy_call || '--'}</td>
+                        <td>₹${(entryPrices.bc || 0).toFixed(2)}</td>
+                        <td id="ic-bc-ltp">--</td>
+                        <td id="ic-bc-pnl">--</td>
+                    </tr>
+                    <tr>
+                        <td style="color:#ff5252;">SELL PUT</td>
+                        <td>${strikes.sell_put || '--'}</td>
+                        <td>₹${(entryPrices.sp || 0).toFixed(2)}</td>
+                        <td id="ic-sp-ltp">--</td>
+                        <td id="ic-sp-pnl">--</td>
+                    </tr>
+                    <tr>
+                        <td style="color:#00c853;">BUY PUT</td>
+                        <td>${strikes.buy_put || '--'}</td>
+                        <td>₹${(entryPrices.bp || 0).toFixed(2)}</td>
+                        <td id="ic-bp-ltp">--</td>
+                        <td id="ic-bp-pnl">--</td>
+                    </tr>
+                `;
+                
+                // Fetch live P&L
+                fetchLivePnl('iron_condor');
+            } else {
+                icPos.style.display = 'none';
+            }
+            
+            // Straddle Position
+            if (posData.straddle) {
+                strPos.style.display = 'block';
+                const str = posData.straddle;
+                
+                // Entry details
+                document.getElementById('str-entry-time').textContent = str.entry_time ? new Date(str.entry_time).toLocaleTimeString('en-IN') : '--';
+                document.getElementById('str-strike').textContent = str.strike || '--';
+                document.getElementById('str-spot-entry').textContent = str.spot_at_entry ? str.spot_at_entry.toFixed(2) : '--';
+                document.getElementById('str-expiry').textContent = str.expiry || '--';
+                document.getElementById('str-qty').textContent = str.quantity + ' (' + str.num_lots + ' lots)';
+                
+                // Entry premium
+                const entryPremium = str.entry_premium || 0;
+                document.getElementById('str-entry-premium').textContent = '₹' + entryPremium.toFixed(2);
+                
+                // Legs table
+                const entryPrices = str.entry_prices || {};
+                document.getElementById('str-legs').innerHTML = `
+                    <tr>
+                        <td style="color:#ff5252;">SELL ${str.strike} CE</td>
+                        <td>₹${(entryPrices.ce || 0).toFixed(2)}</td>
+                        <td id="str-ce-ltp">--</td>
+                        <td id="str-ce-pnl">--</td>
+                    </tr>
+                    <tr>
+                        <td style="color:#ff5252;">SELL ${str.strike} PE</td>
+                        <td>₹${(entryPrices.pe || 0).toFixed(2)}</td>
+                        <td id="str-pe-ltp">--</td>
+                        <td id="str-pe-pnl">--</td>
+                    </tr>
+                `;
+                
+                // Fetch live P&L
+                fetchLivePnl('straddle');
+            } else {
+                strPos.style.display = 'none';
+            }
+        }
+        
+        async function fetchLivePnl(strategy) {
+            try {
+                const res = await fetch('/api/live_pnl?strategy=' + strategy);
+                const data = await res.json();
+                
+                if (strategy === 'iron_condor' && data.iron_condor) {
+                    const ic = data.iron_condor;
+                    const pnl = ic.pnl_amount || 0;
+                    const pnlPct = ic.pnl_percent || 0;
+                    
+                    // Update header P&L
+                    const pnlEl = document.getElementById('ic-pnl');
+                    pnlEl.textContent = '₹' + pnl.toLocaleString('en-IN', {maximumFractionDigits: 0});
+                    pnlEl.className = 'position-pnl ' + (pnl >= 0 ? 'positive' : 'negative');
+                    
+                    // Update current premium
+                    document.getElementById('ic-current-premium').textContent = '₹' + (ic.current_premium || 0).toFixed(2);
+                    
+                    // Update unrealized P&L
+                    const unrealizedEl = document.getElementById('ic-unrealized-pnl');
+                    unrealizedEl.textContent = '₹' + pnl.toLocaleString('en-IN', {maximumFractionDigits: 0});
+                    unrealizedEl.className = 'pnl-value ' + (pnl >= 0 ? 'positive' : 'negative');
+                    
+                    // Update P&L %
+                    document.getElementById('ic-pnl-pct').textContent = (pnl >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%';
+                    
+                    // Update current prices in table
+                    if (ic.current_prices) {
+                        const cp = ic.current_prices;
+                        document.getElementById('ic-sc-ltp').textContent = '₹' + (cp.sc || 0).toFixed(2);
+                        document.getElementById('ic-bc-ltp').textContent = '₹' + (cp.bc || 0).toFixed(2);
+                        document.getElementById('ic-sp-ltp').textContent = '₹' + (cp.sp || 0).toFixed(2);
+                        document.getElementById('ic-bp-ltp').textContent = '₹' + (cp.bp || 0).toFixed(2);
+                    }
+                    
+                    // Update progress bar (map -100% to +50% -> 0% to 100%)
+                    const progress = document.getElementById('ic-progress');
+                    const progressPct = Math.min(100, Math.max(0, ((pnlPct + ic.stoploss_pct) / (ic.target_pct + ic.stoploss_pct)) * 100));
+                    progress.style.left = progressPct + '%';
+                    
+                    // Update labels
+                    document.getElementById('ic-sl-label').textContent = '-' + ic.stoploss_pct + '%';
+                    document.getElementById('ic-target-label').textContent = '+' + ic.target_pct + '%';
+                }
+                
+                if (strategy === 'straddle' && data.straddle) {
+                    const str = data.straddle;
+                    const pnl = str.pnl_amount || 0;
+                    const pnlPct = str.pnl_percent || 0;
+                    
+                    // Update header P&L
+                    const pnlEl = document.getElementById('str-pnl');
+                    pnlEl.textContent = '₹' + pnl.toLocaleString('en-IN', {maximumFractionDigits: 0});
+                    pnlEl.className = 'position-pnl ' + (pnl >= 0 ? 'positive' : 'negative');
+                    
+                    // Update current premium
+                    document.getElementById('str-current-premium').textContent = '₹' + (str.current_premium || 0).toFixed(2);
+                    
+                    // Update unrealized P&L
+                    const unrealizedEl = document.getElementById('str-unrealized-pnl');
+                    unrealizedEl.textContent = '₹' + pnl.toLocaleString('en-IN', {maximumFractionDigits: 0});
+                    unrealizedEl.className = 'pnl-value ' + (pnl >= 0 ? 'positive' : 'negative');
+                    
+                    // Update P&L %
+                    document.getElementById('str-pnl-pct').textContent = (pnl >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%';
+                    
+                    // Update current prices in table
+                    if (str.current_prices) {
+                        document.getElementById('str-ce-ltp').textContent = '₹' + (str.current_prices.ce || 0).toFixed(2);
+                        document.getElementById('str-pe-ltp').textContent = '₹' + (str.current_prices.pe || 0).toFixed(2);
+                    }
+                    
+                    // Update progress bar
+                    const progress = document.getElementById('str-progress');
+                    const progressPct = Math.min(100, Math.max(0, ((pnlPct + str.stoploss_pct) / (str.target_pct + str.stoploss_pct)) * 100));
+                    progress.style.left = progressPct + '%';
+                    
+                    // Update labels
+                    document.getElementById('str-sl-label').textContent = '-' + str.stoploss_pct + '%';
+                    document.getElementById('str-target-label').textContent = '+' + str.target_pct + '%';
+                }
+            } catch (e) {
+                console.error('Error fetching live P&L:', e);
+            }
         }
         
         function updateTable(trades) {
@@ -1649,7 +2279,7 @@ DASHBOARD_HTML = """
         
         initChart();
         refreshData();
-        setInterval(refreshData, 10000);  // Refresh every 10 seconds
+        setInterval(refreshData, 5000);  // Refresh every 5 seconds for live P&L
     </script>
 </body>
 </html>
@@ -1673,6 +2303,81 @@ def api_trades():
 @app.route('/api/history')
 def api_history():
     return jsonify(load_trade_history())
+
+@app.route('/api/position')
+def api_position():
+    """Get current live positions with real-time P&L"""
+    pos_data = load_position()
+    
+    result = {
+        "has_position": False,
+        "iron_condor": None,
+        "straddle": None,
+        "total_unrealized_pnl": 0,
+        "last_update": pos_data.get("last_update", "")
+    }
+    
+    if pos_data.get("iron_condor"):
+        result["has_position"] = True
+        result["iron_condor"] = pos_data["iron_condor"]
+    
+    if pos_data.get("straddle"):
+        result["has_position"] = True
+        result["straddle"] = pos_data["straddle"]
+    
+    return jsonify(result)
+
+# Global references for live P&L (set by bot_thread)
+_live_ic = None
+_live_straddle = None
+
+@app.route('/api/live_pnl')
+def api_live_pnl():
+    """Get real-time P&L for active positions"""
+    global _live_ic, _live_straddle
+    
+    strategy = request.args.get("strategy", "all")
+    result = {
+        "iron_condor": None,
+        "straddle": None
+    }
+    
+    # Try to get live P&L from strategy instances
+    if strategy in ["iron_condor", "all"] and _live_ic and _live_ic.position:
+        pnl_data = _live_ic.get_live_pnl()
+        if pnl_data:
+            result["iron_condor"] = pnl_data
+    
+    if strategy in ["straddle", "all"] and _live_straddle and _live_straddle.position:
+        pnl_data = _live_straddle.get_live_pnl()
+        if pnl_data:
+            result["straddle"] = pnl_data
+    
+    # Fallback to stored position data if live not available
+    if not result["iron_condor"] and not result["straddle"]:
+        pos_data = load_position()
+        if pos_data.get("iron_condor"):
+            result["iron_condor"] = {
+                "entry_premium": pos_data["iron_condor"].get("entry_premium", 0),
+                "current_premium": pos_data["iron_condor"].get("entry_premium", 0),
+                "pnl_amount": 0,
+                "pnl_percent": 0,
+                "target_pct": IC_TARGET_PERCENT,
+                "stoploss_pct": IC_STOP_LOSS_PERCENT,
+                "current_prices": pos_data["iron_condor"].get("entry_prices", {})
+            }
+        if pos_data.get("straddle"):
+            result["straddle"] = {
+                "entry_premium": pos_data["straddle"].get("entry_premium", 0),
+                "current_premium": pos_data["straddle"].get("entry_premium", 0),
+                "pnl_amount": 0,
+                "pnl_percent": 0,
+                "target_pct": STR_TARGET_PERCENT,
+                "stoploss_pct": STR_STOP_LOSS_PERCENT,
+                "current_prices": pos_data["straddle"].get("entry_prices", {})
+            }
+    
+    return jsonify(result)
 
 @app.route('/api/strategy', methods=['POST'])
 def api_strategy():
