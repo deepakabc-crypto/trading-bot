@@ -53,10 +53,13 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CAPITAL` | Trading capital | 500000 |
-| `QUANTITY` | Lot size | 65 |
+| `LOT_SIZE` | Nifty lot size | 75 |
+| `NUM_LOTS` | Number of lots to trade | 1 |
 | `STRATEGY` | iron_condor / straddle / both | iron_condor |
-| `MIN_PREMIUM` | Minimum premium to enter | 20 |
+| `MIN_PREMIUM` | Minimum premium to enter | 10 |
 | `AUTO_START` | Auto-start bot on deploy | true |
+
+> **Note:** Total quantity = LOT_SIZE × NUM_LOTS (e.g., 75 × 2 = 150)
 
 #### Optional - Timing (IST)
 
@@ -66,6 +69,13 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | `ENTRY_TIME_END` | End of entry window | 14:00 |
 | `EXIT_TIME` | Force exit all positions | 15:15 |
 | `CHECK_INTERVAL` | Seconds between checks | 30 |
+| `CUSTOM_EXPIRY` | Override expiry date (for holidays) | *(empty)* |
+| `USE_CURRENT_EXPIRY` | Use current week expiry on Thursday | false |
+| `EXPIRY_DAY_CUTOFF` | Time after which to use next expiry on Thursday | 09:30 |
+
+> **Holiday Expiry:** When expiry is shifted due to a holiday (e.g., Thursday is holiday, expiry moves to Monday/Tuesday), set `CUSTOM_EXPIRY=17-02-2026` to override.
+>
+> **Supported formats:** `17-02-2026`, `2026-02-17`, `17-Feb-2026`, `17/02/2026`
 
 #### Optional - Strategy Parameters
 
@@ -193,6 +203,23 @@ Access via:
 
 ### "Found 0 expiry dates"
 This error is now fixed! The backtester calculates expiry dates programmatically without API calls.
+
+### "No Data Found" for option quotes
+This usually means:
+1. **Wrong expiry** - On Thursday, the bot now uses next week's expiry by default
+2. **Strike doesn't exist** - The strike price might not have contracts. Check if the strike is valid.
+3. **API issue** - Breeze API might be down. The bot will retry 3 times.
+
+The bot now tries multiple expiry formats:
+- `2026-02-19T07:00:00.000Z` (ISO format)
+- `19-Feb-2026` (DD-Mon-YYYY)
+- `2026-02-19` (YYYY-MM-DD)
+
+### "Credit 0 < MIN_PREMIUM"
+This means the option quotes returned 0 or failed. Check:
+1. Session token is valid
+2. Market is open
+3. Expiry date is correct (check `/api/status` endpoint)
 
 ### "ModuleNotFoundError: schedule"
 Fixed in `requirements.txt` - includes `schedule>=1.2.0`

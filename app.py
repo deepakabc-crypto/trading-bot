@@ -40,7 +40,12 @@ API_SESSION = os.environ.get("API_SESSION", "") or os.environ.get("SESSION_TOKEN
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL = int(os.environ.get("CAPITAL", "500000"))
-QUANTITY = int(os.environ.get("QUANTITY", "65"))  # Nifty lot size (configurable)
+
+# Lot size settings - MULTIPLE LOTS SUPPORT
+LOT_SIZE = int(os.environ.get("LOT_SIZE", "75"))  # Nifty lot size (changed to 75 from 65)
+NUM_LOTS = int(os.environ.get("NUM_LOTS", "1"))   # Number of lots to trade
+QUANTITY = LOT_SIZE * NUM_LOTS  # Total quantity
+
 STRATEGY = os.environ.get("STRATEGY", "iron_condor")
 
 # Strategy settings
@@ -58,12 +63,20 @@ ENTRY_TIME_START = os.environ.get("ENTRY_TIME_START", "09:20")
 ENTRY_TIME_END = os.environ.get("ENTRY_TIME_END", "14:00")
 EXIT_TIME = os.environ.get("EXIT_TIME", "15:15")
 TRADING_DAYS = [0, 1, 2, 3, 4]  # Monday to Friday
-MIN_PREMIUM = int(os.environ.get("MIN_PREMIUM", "20"))
+MIN_PREMIUM = int(os.environ.get("MIN_PREMIUM", "10"))  # Lowered to 10
 CHARGES_PER_LOT = int(os.environ.get("CHARGES_PER_LOT", "100"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 
 # Auto-start trading
 AUTO_START = os.environ.get("AUTO_START", "true").lower() == "true"
+
+# Expiry settings
+USE_CURRENT_EXPIRY = os.environ.get("USE_CURRENT_EXPIRY", "false").lower() == "true"  # Use current week expiry even on Thursday
+EXPIRY_DAY_CUTOFF = os.environ.get("EXPIRY_DAY_CUTOFF", "09:30")  # After this time on Thursday, use next expiry
+
+# Custom expiry override (for holiday-shifted expiries)
+# Format: DD-MM-YYYY or YYYY-MM-DD (e.g., "17-02-2026" or "2026-02-17")
+CUSTOM_EXPIRY = os.environ.get("CUSTOM_EXPIRY", "")  # Set this when expiry is not on Thursday
 
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -202,22 +215,81 @@ def get_weekly_expiries(start_date: datetime, end_date: datetime) -> List[dateti
     expiries = sorted(list(set(expiries)))
     return expiries
 
+def parse_custom_expiry(expiry_str: str) -> datetime:
+    """Parse custom expiry date from various formats"""
+    formats = [
+        "%d-%m-%Y",    # 17-02-2026
+        "%Y-%m-%d",    # 2026-02-17
+        "%d-%b-%Y",    # 17-Feb-2026
+        "%d/%m/%Y",    # 17/02/2026
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(expiry_str.strip(), fmt)
+        except:
+            continue
+    return None
+
 def get_next_expiry(from_date: datetime = None) -> datetime:
-    """Get the next weekly expiry (Thursday) from given date"""
+    """Get the next weekly expiry date
+    
+    Priority:
+    1. CUSTOM_EXPIRY environment variable (for holiday-shifted expiries)
+    2. Calculated Thursday expiry
+    
+    On Thursday (expiry day):
+    - Before cutoff time: Use current day's expiry (if USE_CURRENT_EXPIRY=true)
+    - After cutoff time: Use next week's expiry
+    """
+    
+    # Check for custom expiry override first
+    if CUSTOM_EXPIRY:
+        custom = parse_custom_expiry(CUSTOM_EXPIRY)
+        if custom:
+            logger.info(f"📅 Using CUSTOM_EXPIRY: {custom.strftime('%d-%b-%Y')}")
+            return custom
+        else:
+            logger.warning(f"⚠️ Could not parse CUSTOM_EXPIRY: {CUSTOM_EXPIRY}")
+    
     if from_date is None:
-        from_date = datetime.now()
+        from_date = get_ist_now()
     
-    days_ahead = 3 - from_date.weekday()  # Thursday = 3
-    if days_ahead < 0:
+    # Remove timezone info for calculation
+    if hasattr(from_date, 'tzinfo') and from_date.tzinfo is not None:
+        from_date = from_date.replace(tzinfo=None)
+    
+    current_weekday = from_date.weekday()  # Monday=0, Thursday=3
+    current_time = from_date.strftime("%H:%M")
+    
+    # Thursday = 3
+    if current_weekday == 3:  # It's Thursday (expiry day)
+        if USE_CURRENT_EXPIRY and current_time < EXPIRY_DAY_CUTOFF:
+            # Use today's expiry (before cutoff)
+            return from_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            # Use next Thursday
+            return from_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=7)
+    
+    # For other days, find next Thursday
+    days_ahead = 3 - current_weekday  # Thursday = 3
+    if days_ahead <= 0:  # Already past Thursday this week
         days_ahead += 7
-    elif days_ahead == 0 and from_date.hour >= 15:
-        days_ahead = 7
     
-    return from_date + timedelta(days=days_ahead)
+    next_thursday = from_date + timedelta(days=days_ahead)
+    return next_thursday.replace(hour=0, minute=0, second=0, microsecond=0)
 
 def format_expiry_for_breeze(expiry_date: datetime) -> str:
-    """Format expiry date for Breeze API: YYYY-MM-DDTHH:MM:SS.000Z"""
+    """Format expiry date for Breeze API
+    
+    Breeze accepts multiple formats. We'll use: YYYY-MM-DDTHH:MM:SS.000Z
+    But also try: DD-Mon-YYYY format as fallback
+    """
+    # Primary format: ISO with time
     return expiry_date.strftime("%Y-%m-%dT07:00:00.000Z")
+
+def format_expiry_breeze_alt(expiry_date: datetime) -> str:
+    """Alternative format: DD-Mon-YYYY"""
+    return expiry_date.strftime("%d-%b-%Y")
 
 def format_expiry_display(expiry_date: datetime) -> str:
     """Format expiry date for display: DD-Mon-YYYY"""
@@ -343,25 +415,58 @@ class BreezeAPI:
         return None
     
     def get_ltp(self, strike, option_type, expiry):
+        """Get LTP for an option with multiple expiry format attempts"""
         if not self.connected:
             return None
-        try:
-            # Ensure expiry is in correct format
-            if isinstance(expiry, datetime):
-                expiry = format_expiry_for_breeze(expiry)
-            
-            data = self.breeze.get_quotes(
-                stock_code="NIFTY", 
-                exchange_code="NFO", 
-                expiry_date=expiry,
-                product_type="options", 
-                right=option_type.lower(), 
-                strike_price=str(strike)
-            )
-            if data and 'Success' in data:
-                return float(data['Success'][0]['ltp'])
-        except Exception as e:
-            logger.debug(f"LTP error: {e}")
+        
+        # Try multiple expiry formats
+        expiry_formats = []
+        if isinstance(expiry, datetime):
+            expiry_formats = [
+                format_expiry_for_breeze(expiry),  # 2026-02-13T07:00:00.000Z
+                format_expiry_breeze_alt(expiry),   # 13-Feb-2026
+                expiry.strftime("%Y-%m-%d"),        # 2026-02-13
+            ]
+        elif isinstance(expiry, str):
+            expiry_formats = [expiry]
+        
+        for exp_fmt in expiry_formats:
+            try:
+                data = self.breeze.get_quotes(
+                    stock_code="NIFTY", 
+                    exchange_code="NFO", 
+                    expiry_date=exp_fmt,
+                    product_type="options", 
+                    right=option_type.lower(), 
+                    strike_price=str(strike)
+                )
+                
+                # Check for success
+                if data and data.get('Success'):
+                    ltp = float(data['Success'][0]['ltp'])
+                    if ltp > 0:
+                        logger.debug(f"✅ Got LTP {ltp} for {strike}{option_type.upper()} exp={exp_fmt}")
+                        return ltp
+                
+                # Check for error
+                if data and data.get('Error'):
+                    logger.debug(f"API Error for {strike}{option_type.upper()} exp={exp_fmt}: {data.get('Error')}")
+                    
+            except Exception as e:
+                logger.debug(f"LTP error for {strike}{option_type.upper()} exp={exp_fmt}: {e}")
+        
+        logger.warning(f"❌ No data found for {strike}{option_type.upper()}, tried expiries: {expiry_formats}")
+        return None
+    
+    def get_ltp_with_retry(self, strike, option_type, expiry, retries=3):
+        """Get LTP with retry logic"""
+        import time
+        for attempt in range(retries):
+            ltp = self.get_ltp(strike, option_type, expiry)
+            if ltp is not None and ltp > 0:
+                return ltp
+            if attempt < retries - 1:
+                time.sleep(1)  # Wait 1 second before retry
         return None
     
     def get_historical_data(self, strike, option_type, expiry, from_date, to_date, interval="1day"):
@@ -437,7 +542,13 @@ class BreezeAPI:
     def get_expiry(self):
         """Get next expiry date for live trading"""
         expiry = get_next_expiry()
-        return format_expiry_for_breeze(expiry)
+        expiry_str = format_expiry_for_breeze(expiry)
+        logger.info(f"📅 Using expiry: {expiry.strftime('%d-%b-%Y')} ({expiry_str})")
+        return expiry
+    
+    def get_expiry_str(self):
+        """Get next expiry date as formatted string"""
+        return format_expiry_for_breeze(get_next_expiry())
 
 # ============================================
 # BACKTESTING ENGINE
@@ -630,18 +741,43 @@ class IronCondor:
         sc, bc = atm + IC_CALL_SELL_DISTANCE, atm + IC_CALL_BUY_DISTANCE
         sp, bp = atm - IC_PUT_SELL_DISTANCE, atm - IC_PUT_BUY_DISTANCE
         
-        sc_p = self.api.get_ltp(sc, "call", expiry) or 0
-        bc_p = self.api.get_ltp(bc, "call", expiry) or 0
-        sp_p = self.api.get_ltp(sp, "put", expiry) or 0
-        bp_p = self.api.get_ltp(bp, "put", expiry) or 0
+        # Log what we're trying to do
+        expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
+        logger.info(f"🦅 IC Setup: ATM={atm}, Strikes: SC={sc}, BC={bc}, SP={sp}, BP={bp}")
+        logger.info(f"🦅 IC Expiry: {expiry_display}")
+        
+        # Get LTPs with retry
+        logger.info(f"📊 Fetching premiums for {sc}CE...")
+        sc_p = self.api.get_ltp_with_retry(sc, "call", expiry) or 0
+        
+        logger.info(f"📊 Fetching premiums for {bc}CE...")
+        bc_p = self.api.get_ltp_with_retry(bc, "call", expiry) or 0
+        
+        logger.info(f"📊 Fetching premiums for {sp}PE...")
+        sp_p = self.api.get_ltp_with_retry(sp, "put", expiry) or 0
+        
+        logger.info(f"📊 Fetching premiums for {bp}PE...")
+        bp_p = self.api.get_ltp_with_retry(bp, "put", expiry) or 0
+        
+        # Log premiums
+        logger.info(f"📊 Premiums: SC={sc_p}, BC={bc_p}, SP={sp_p}, BP={bp_p}")
+        
+        # Check if any premium is 0 (API issue)
+        if sc_p == 0 or sp_p == 0:
+            logger.warning(f"⚠️ Could not get sell option premiums (SC={sc_p}, SP={sp_p})")
+            telegram.send(f"⚠️ IC Entry failed: Could not get option quotes\nTried: {sc}CE/{sp}PE\nExpiry: {expiry_display}")
+            return False
         
         credit = (sc_p - bc_p) + (sp_p - bp_p)
+        logger.info(f"📊 Net Credit: {credit:.2f} (Call spread: {sc_p - bc_p:.2f}, Put spread: {sp_p - bp_p:.2f})")
+        
         if credit < MIN_PREMIUM:
             logger.info(f"🦅 IC skipped: Credit {credit:.0f} < {MIN_PREMIUM}")
             return False
         
-        logger.info(f"🦅 IC Entry: Credit={credit:.0f}")
+        logger.info(f"🦅 IC Entry: Credit={credit:.0f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
         
+        # Place orders
         self.api.place_order(sc, "call", expiry, QUANTITY, "sell", sc_p)
         self.api.place_order(bc, "call", expiry, QUANTITY, "buy", bc_p)
         self.api.place_order(sp, "put", expiry, QUANTITY, "sell", sp_p)
@@ -650,7 +786,7 @@ class IronCondor:
         self.position = {"sc": sc, "bc": bc, "sp": sp, "bp": bp, "expiry": expiry}
         self.entry_premium = credit
         
-        telegram.send(f"🦅 <b>Iron Condor Entry</b>\nCredit: ₹{credit:.0f}\nSell: {sc}CE/{sp}PE")
+        telegram.send(f"🦅 <b>Iron Condor Entry</b>\nSpot: {spot}\nATM: {atm}\nSell: {sc}CE @ {sc_p:.0f} / {sp}PE @ {sp_p:.0f}\nBuy: {bc}CE @ {bc_p:.0f} / {bp}PE @ {bp_p:.0f}\nCredit: ₹{credit:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
         return True
     
     def check_exit(self):
@@ -720,15 +856,32 @@ class ShortStraddle:
     def enter(self, spot, expiry):
         atm = round(spot / 50) * 50
         
-        ce = self.api.get_ltp(atm, "call", expiry) or 0
-        pe = self.api.get_ltp(atm, "put", expiry) or 0
+        # Log what we're trying to do
+        expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
+        logger.info(f"📊 Straddle Setup: ATM={atm}, Expiry={expiry_display}")
+        
+        # Get LTPs with retry
+        logger.info(f"📊 Fetching premium for {atm}CE...")
+        ce = self.api.get_ltp_with_retry(atm, "call", expiry) or 0
+        
+        logger.info(f"📊 Fetching premium for {atm}PE...")
+        pe = self.api.get_ltp_with_retry(atm, "put", expiry) or 0
+        
+        logger.info(f"📊 Premiums: CE={ce}, PE={pe}")
+        
+        # Check if any premium is 0 (API issue)
+        if ce == 0 or pe == 0:
+            logger.warning(f"⚠️ Could not get straddle premiums (CE={ce}, PE={pe})")
+            telegram.send(f"⚠️ Straddle Entry failed: Could not get option quotes\nTried: {atm}CE/{atm}PE\nExpiry: {expiry_display}")
+            return False
+        
         total = ce + pe
         
         if total < MIN_PREMIUM:
             logger.info(f"📊 Straddle skipped: Premium {total:.0f} < {MIN_PREMIUM}")
             return False
         
-        logger.info(f"📊 Straddle Entry: {atm}, Premium={total:.0f}")
+        logger.info(f"📊 Straddle Entry: {atm}, Premium={total:.0f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
         
         self.api.place_order(atm, "call", expiry, QUANTITY, "sell", ce)
         self.api.place_order(atm, "put", expiry, QUANTITY, "sell", pe)
@@ -736,7 +889,7 @@ class ShortStraddle:
         self.position = {"strike": atm, "expiry": expiry}
         self.entry_premium = total
         
-        telegram.send(f"📊 <b>Straddle Entry</b>\nStrike: {atm}\nPremium: ₹{total:.0f}")
+        telegram.send(f"📊 <b>Straddle Entry</b>\nSpot: {spot}\nStrike: {atm}\nCE: ₹{ce:.0f} / PE: ₹{pe:.0f}\nTotal Premium: ₹{total:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
         return True
     
     def check_exit(self):
@@ -827,8 +980,15 @@ def bot_thread():
     logger.info(f"⏰ Entry Time: {ENTRY_TIME_START} - {ENTRY_TIME_END} IST")
     logger.info(f"⏰ Exit Time: {EXIT_TIME} IST")
     logger.info(f"📊 Strategy: {STRATEGY}")
-    logger.info(f"💰 Quantity: {QUANTITY} lots")
+    logger.info(f"💰 Lot Size: {LOT_SIZE}, Num Lots: {NUM_LOTS}, Total Qty: {QUANTITY}")
+    logger.info(f"💵 Min Premium: {MIN_PREMIUM}")
     logger.info(f"🚀 Auto-start: {AUTO_START}")
+    
+    # Log expiry info
+    if CUSTOM_EXPIRY:
+        logger.info(f"📅 CUSTOM_EXPIRY set: {CUSTOM_EXPIRY}")
+    next_exp = get_next_expiry()
+    logger.info(f"📅 Next Expiry: {next_exp.strftime('%d-%b-%Y')} ({next_exp.strftime('%A')})")
     
     # Auto-start if enabled
     if AUTO_START:
@@ -1116,6 +1276,7 @@ DASHBOARD_HTML = """
                 <span class="badge" id="time-badge" style="background: #333;">🕐 --:--:-- IST</span>
                 <span class="badge" id="market-badge" style="background: #666;">📊 MARKET CLOSED</span>
                 <span class="badge" id="window-badge" style="background: #666;">⏳ WAITING</span>
+                <span class="badge" id="expiry-badge" style="background: #9c27b0;">📅 Expiry: --</span>
             </div>
         </div>
         
@@ -1274,7 +1435,7 @@ DASHBOARD_HTML = """
         </div>
         
         <div style="text-align:center; color:#555; margin-top:30px;">
-            <p>Lot Size: 65 | Market: 9:15 AM - 3:30 PM IST</p>
+            <p id="footer-info">Lot Size: 75 | Market: 9:15 AM - 3:30 PM IST</p>
         </div>
     </div>
     
@@ -1356,6 +1517,21 @@ DASHBOARD_HTML = """
                     windowBadge.textContent = '⏳ WAITING (Entry: ' + status.entry_time_start + ')';
                     windowBadge.style.background = '#ff9800';
                 }
+                
+                // Update expiry badge
+                const expiryBadge = document.getElementById('expiry-badge');
+                expiryBadge.textContent = '📅 Expiry: ' + status.next_expiry + ' (' + status.next_expiry_day.slice(0,3) + ')';
+                if (status.custom_expiry) {
+                    expiryBadge.style.background = '#e91e63';  // Pink for custom expiry
+                } else {
+                    expiryBadge.style.background = '#9c27b0';  // Purple for normal
+                }
+                
+                // Update footer
+                document.getElementById('footer-info').textContent = 
+                    'Lot Size: ' + status.lot_size + ' × ' + status.num_lots + ' = ' + status.quantity + 
+                    ' | Min Premium: ₹' + status.min_premium + 
+                    ' | Market: 9:15 AM - 3:30 PM IST';
                 
                 const tradesRes = await fetch('/api/trades');
                 const trades = await tradesRes.json();
@@ -1576,6 +1752,7 @@ def health():
 def api_status():
     """Get detailed bot status including timing info"""
     now = get_ist_now()
+    next_exp = get_next_expiry()
     return jsonify({
         "current_time_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
         "current_time_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1585,7 +1762,13 @@ def api_status():
         "is_trading_time": is_trading_time(),
         "is_exit_time": is_exit_time(),
         "is_market_hours": is_market_hours(),
+        "custom_expiry": CUSTOM_EXPIRY if CUSTOM_EXPIRY else None,
+        "next_expiry": next_exp.strftime("%d-%b-%Y"),
+        "next_expiry_day": next_exp.strftime("%A"),
+        "next_expiry_breeze": format_expiry_for_breeze(next_exp),
         "strategy": STRATEGY,
+        "lot_size": LOT_SIZE,
+        "num_lots": NUM_LOTS,
         "quantity": QUANTITY,
         "min_premium": MIN_PREMIUM,
         "auto_start": AUTO_START,
@@ -1604,6 +1787,8 @@ def api_settings():
             "entry_time_end": ENTRY_TIME_END,
             "exit_time": EXIT_TIME,
             "strategy": STRATEGY,
+            "lot_size": LOT_SIZE,
+            "num_lots": NUM_LOTS,
             "quantity": QUANTITY,
             "min_premium": MIN_PREMIUM,
             "ic_call_sell_distance": IC_CALL_SELL_DISTANCE,
