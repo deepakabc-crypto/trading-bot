@@ -16,6 +16,8 @@ import os
 import time
 import threading
 import logging
+import math
+import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import calendar
@@ -659,8 +661,9 @@ class BreezeAPI:
 # ============================================
 class Backtester:
     def __init__(self, api: BreezeAPI = None):
-        self.api = api
+        self.api = api or BreezeAPI()
         self.results = []
+        self.use_historical_api = False  # Set to True to fetch from Breeze API
         
     def get_expiry_dates(self, start_date: datetime, end_date: datetime) -> List[datetime]:
         """Get all weekly expiry dates for backtesting period"""
@@ -668,10 +671,78 @@ class Backtester:
         logger.info(f"Found {len(expiries)} expiry dates from {start_date.date()} to {end_date.date()}")
         return expiries
     
-    def simulate_iron_condor(self, spot: float, expiry: datetime, 
+    def estimate_option_premium(self, spot: float, strike: float, days_to_expiry: int, 
+                                 option_type: str, iv: float = 0.15) -> float:
+        """
+        Estimate option premium using simplified Black-Scholes approximation
+        More realistic than previous formula
+        """
+        # Ensure minimum 1 day to expiry
+        dte = max(days_to_expiry, 1)
+        
+        # Calculate moneyness
+        if option_type.lower() == "call":
+            moneyness = (spot - strike) / spot  # Positive = ITM, Negative = OTM
+        else:  # put
+            moneyness = (strike - spot) / spot  # Positive = ITM, Negative = OTM
+        
+        # Time factor (annualized)
+        time_factor = math.sqrt(dte / 365)
+        
+        # Base ATM premium (roughly 1.5-2.5% of spot for weekly options)
+        atm_premium = spot * iv * time_factor * 0.4
+        
+        # Adjust for moneyness
+        if moneyness > 0:  # ITM
+            intrinsic = abs(spot - strike)
+            premium = intrinsic + atm_premium * 0.5  # ITM has less time value
+        else:  # OTM
+            # Premium decays with distance from ATM
+            otm_factor = math.exp(-abs(moneyness) * 10)  # Decay factor
+            premium = atm_premium * otm_factor
+        
+        # Minimum premium
+        return max(round(premium, 2), 2.0)
+    
+    def get_historical_premium(self, strike: int, option_type: str, expiry: datetime, 
+                                trade_date: datetime) -> float:
+        """
+        Get historical premium from Breeze API
+        Returns None if not available
+        """
+        if not self.api.connected:
+            return None
+        
+        try:
+            # Format dates for API
+            from_date = trade_date.strftime("%Y-%m-%dT09:15:00.000Z")
+            to_date = trade_date.strftime("%Y-%m-%dT15:30:00.000Z")
+            expiry_str = format_expiry_for_breeze(expiry)
+            
+            data = self.api.breeze.get_historical_data_v2(
+                interval="1day",
+                from_date=from_date,
+                to_date=to_date,
+                stock_code="NIFTY",
+                exchange_code="NFO",
+                product_type="options",
+                expiry_date=expiry_str,
+                right=option_type.lower(),
+                strike_price=str(strike)
+            )
+            
+            if data and data.get('Success') and len(data['Success']) > 0:
+                # Return opening price as entry premium
+                return float(data['Success'][0].get('open', 0))
+        except Exception as e:
+            logger.debug(f"Historical data error for {strike}{option_type}: {e}")
+        
+        return None
+    
+    def simulate_iron_condor(self, spot: float, expiry: datetime, trade_date: datetime,
                              call_sell_dist: int = 150, call_buy_dist: int = 250,
                              put_sell_dist: int = 150, put_buy_dist: int = 250) -> Dict:
-        """Simulate Iron Condor trade with estimated premiums"""
+        """Simulate Iron Condor trade with realistic premium estimation"""
         atm = round(spot / 50) * 50
         
         # Strike prices
@@ -680,49 +751,99 @@ class Backtester:
         sp = atm - put_sell_dist   # Sell Put
         bp = atm - put_buy_dist    # Buy Put
         
-        # Estimate premiums based on moneyness (simplified Black-Scholes approximation)
-        days_to_expiry = max((expiry - datetime.now()).days, 1)
-        iv = 0.15  # Assumed IV
+        # Calculate days to expiry from trade date (NOT from today!)
+        days_to_expiry = max((expiry - trade_date).days, 1)
         
-        # Simplified premium estimation
-        sc_premium = max(5, 100 - (call_sell_dist / 10) * (7 / days_to_expiry))
-        bc_premium = max(2, 50 - (call_buy_dist / 10) * (7 / days_to_expiry))
-        sp_premium = max(5, 100 - (put_sell_dist / 10) * (7 / days_to_expiry))
-        bp_premium = max(2, 50 - (put_buy_dist / 10) * (7 / days_to_expiry))
+        # Try to get historical data from API if enabled
+        if self.use_historical_api and self.api.connected:
+            sc_premium = self.get_historical_premium(sc, "call", expiry, trade_date)
+            bc_premium = self.get_historical_premium(bc, "call", expiry, trade_date)
+            sp_premium = self.get_historical_premium(sp, "put", expiry, trade_date)
+            bp_premium = self.get_historical_premium(bp, "put", expiry, trade_date)
+            
+            # If all premiums fetched successfully
+            if all([sc_premium, bc_premium, sp_premium, bp_premium]):
+                credit = (sc_premium - bc_premium) + (sp_premium - bp_premium)
+                return {
+                    "strategy": "IRON_CONDOR",
+                    "spot": round(spot, 2),
+                    "atm": atm,
+                    "strikes": {"sc": sc, "bc": bc, "sp": sp, "bp": bp},
+                    "premiums": {"sc": sc_premium, "bc": bc_premium, "sp": sp_premium, "bp": bp_premium},
+                    "credit": round(credit, 2),
+                    "max_loss": (bc - sc) - credit,
+                    "expiry": expiry.strftime("%Y-%m-%d"),
+                    "days_to_expiry": days_to_expiry,
+                    "data_source": "API"
+                }
+        
+        # Use estimation if API not available
+        iv = 0.12 + (0.05 * (1 / days_to_expiry))  # IV increases closer to expiry
+        
+        sc_premium = self.estimate_option_premium(spot, sc, days_to_expiry, "call", iv)
+        bc_premium = self.estimate_option_premium(spot, bc, days_to_expiry, "call", iv)
+        sp_premium = self.estimate_option_premium(spot, sp, days_to_expiry, "put", iv)
+        bp_premium = self.estimate_option_premium(spot, bp, days_to_expiry, "put", iv)
         
         credit = (sc_premium - bc_premium) + (sp_premium - bp_premium)
-        max_loss = (call_buy_dist - call_sell_dist) - credit
+        max_loss = (bc - sc) - credit
         
         return {
             "strategy": "IRON_CONDOR",
-            "spot": spot,
+            "spot": round(spot, 2),
             "atm": atm,
             "strikes": {"sc": sc, "bc": bc, "sp": sp, "bp": bp},
-            "premiums": {"sc": sc_premium, "bc": bc_premium, "sp": sp_premium, "bp": bp_premium},
-            "credit": credit,
-            "max_loss": max_loss,
-            "expiry": expiry.strftime("%Y-%m-%d")
+            "premiums": {"sc": round(sc_premium, 2), "bc": round(bc_premium, 2), 
+                        "sp": round(sp_premium, 2), "bp": round(bp_premium, 2)},
+            "credit": round(credit, 2),
+            "max_loss": round(max_loss, 2),
+            "expiry": expiry.strftime("%Y-%m-%d"),
+            "days_to_expiry": days_to_expiry,
+            "data_source": "ESTIMATED"
         }
     
-    def simulate_straddle(self, spot: float, expiry: datetime) -> Dict:
-        """Simulate Short Straddle trade"""
+    def simulate_straddle(self, spot: float, expiry: datetime, trade_date: datetime) -> Dict:
+        """Simulate Short Straddle trade with realistic premium estimation"""
         atm = round(spot / 50) * 50
-        days_to_expiry = max((expiry - datetime.now()).days, 1)
+        days_to_expiry = max((expiry - trade_date).days, 1)
         
-        # Simplified premium estimation
-        ce_premium = max(50, 200 * (days_to_expiry / 7) ** 0.5)
-        pe_premium = max(50, 200 * (days_to_expiry / 7) ** 0.5)
+        # Try to get historical data from API if enabled
+        if self.use_historical_api and self.api.connected:
+            ce_premium = self.get_historical_premium(atm, "call", expiry, trade_date)
+            pe_premium = self.get_historical_premium(atm, "put", expiry, trade_date)
+            
+            if ce_premium and pe_premium:
+                return {
+                    "strategy": "SHORT_STRADDLE",
+                    "spot": round(spot, 2),
+                    "strike": atm,
+                    "ce_premium": ce_premium,
+                    "pe_premium": pe_premium,
+                    "total_premium": round(ce_premium + pe_premium, 2),
+                    "expiry": expiry.strftime("%Y-%m-%d"),
+                    "days_to_expiry": days_to_expiry,
+                    "data_source": "API"
+                }
         
+        # Use estimation - ATM options have highest time value
+        iv = 0.12 + (0.05 * (1 / days_to_expiry))
+        
+        ce_premium = self.estimate_option_premium(spot, atm, days_to_expiry, "call", iv)
+        pe_premium = self.estimate_option_premium(spot, atm, days_to_expiry, "put", iv)
+        
+        # ATM options are roughly equal, slight adjustment for put-call parity
         total_premium = ce_premium + pe_premium
         
         return {
             "strategy": "SHORT_STRADDLE",
-            "spot": spot,
+            "spot": round(spot, 2),
             "strike": atm,
-            "ce_premium": ce_premium,
-            "pe_premium": pe_premium,
-            "total_premium": total_premium,
-            "expiry": expiry.strftime("%Y-%m-%d")
+            "ce_premium": round(ce_premium, 2),
+            "pe_premium": round(pe_premium, 2),
+            "total_premium": round(total_premium, 2),
+            "expiry": expiry.strftime("%Y-%m-%d"),
+            "days_to_expiry": days_to_expiry,
+            "data_source": "ESTIMATED"
         }
     
     def simulate_intraday_exit(self, entry_premium: float, target_pct: float, sl_pct: float,
@@ -731,8 +852,6 @@ class Backtester:
         Simulate intraday price movement and determine exit
         Returns: exit_time, exit_reason, pnl_percent
         """
-        import random
-        
         # Parse times
         entry_hour, entry_min = map(int, entry_time.split(':'))
         exit_hour, exit_min = map(int, exit_time.split(':'))
@@ -785,7 +904,7 @@ class Backtester:
     def run_backtest(self, start_date: datetime, end_date: datetime, 
                      strategy: str = "iron_condor", initial_capital: float = 500000,
                      entry_time_start: str = None, entry_time_end: str = None,
-                     exit_time: str = None) -> Dict:
+                     exit_time: str = None, use_historical_api: bool = False) -> Dict:
         """Run backtest for given period using bot's entry/exit times"""
         
         # Use provided times or defaults from settings
@@ -793,8 +912,17 @@ class Backtester:
         entry_end = entry_time_end or ENTRY_TIME_END
         force_exit = exit_time or EXIT_TIME
         
+        # Set historical API flag
+        self.use_historical_api = use_historical_api
+        
         logger.info(f"🔬 Starting backtest: {strategy} from {start_date.date()} to {end_date.date()}")
         logger.info(f"⏰ Entry Window: {entry_start} - {entry_end}, Exit Time: {force_exit}")
+        logger.info(f"📊 Data Source: {'Breeze API Historical' if use_historical_api else 'Estimated Premiums'}")
+        
+        # Try to connect to API if using historical data
+        if use_historical_api and not self.api.connected:
+            logger.info("🔌 Connecting to Breeze API for historical data...")
+            self.api.connect()
         
         expiries = self.get_expiry_dates(start_date, end_date)
         
@@ -809,7 +937,9 @@ class Backtester:
         
         trades = []
         capital = initial_capital
-        spot = 22500  # Default spot
+        spot = 22500  # Default starting spot
+        api_data_count = 0
+        estimated_data_count = 0
         
         # Get trading days for each expiry week
         for expiry in expiries:
@@ -829,7 +959,6 @@ class Backtester:
             
             for trade_date in trading_days:
                 # Random entry time within entry window
-                import random
                 entry_h, entry_m = map(int, entry_start.split(':'))
                 end_h, end_m = map(int, entry_end.split(':'))
                 
@@ -839,10 +968,16 @@ class Backtester:
                 
                 if strategy in ["iron_condor", "both"]:
                     trade = self.simulate_iron_condor(
-                        spot, expiry,
+                        spot, expiry, trade_date,  # Pass trade_date!
                         IC_CALL_SELL_DISTANCE, IC_CALL_BUY_DISTANCE,
                         IC_PUT_SELL_DISTANCE, IC_PUT_BUY_DISTANCE
                     )
+                    
+                    # Track data source
+                    if trade.get("data_source") == "API":
+                        api_data_count += 1
+                    else:
+                        estimated_data_count += 1
                     
                     # Simulate intraday exit
                     exit_result = self.simulate_intraday_exit(
@@ -875,7 +1010,13 @@ class Backtester:
                     capital += pnl
                 
                 if strategy in ["straddle", "both"]:
-                    trade = self.simulate_straddle(spot, expiry)
+                    trade = self.simulate_straddle(spot, expiry, trade_date)  # Pass trade_date!
+                    
+                    # Track data source
+                    if trade.get("data_source") == "API":
+                        api_data_count += 1
+                    else:
+                        estimated_data_count += 1
                     
                     # Simulate intraday exit
                     exit_result = self.simulate_intraday_exit(
@@ -930,6 +1071,12 @@ class Backtester:
             avg_mins = sum(exit_mins) // len(exit_mins)
             avg_exit_time = f"{avg_mins // 60:02d}:{avg_mins % 60:02d}"
         
+        # Average premium
+        avg_premium = 0
+        if trades:
+            premiums = [t.get("credit") or t.get("total_premium", 0) for t in trades]
+            avg_premium = sum(premiums) / len(premiums) if premiums else 0
+        
         results = {
             "strategy": strategy,
             "start_date": start_date.strftime("%Y-%m-%d"),
@@ -952,9 +1099,15 @@ class Backtester:
                 "time_exit": time_exits
             },
             "avg_exit_time": avg_exit_time,
+            "avg_premium": round(avg_premium, 2),
             "lot_size": LOT_SIZE,
             "num_lots": NUM_LOTS,
             "quantity": QUANTITY,
+            "data_source": {
+                "api_data": api_data_count,
+                "estimated_data": estimated_data_count,
+                "use_historical_api": use_historical_api
+            },
             "trades": trades
         }
         
@@ -968,6 +1121,7 @@ class Backtester:
         
         logger.info(f"🔬 Backtest complete: {total_trades} trades, {results['win_rate']:.1f}% win rate, ₹{total_pnl:,.0f} P&L")
         logger.info(f"📊 Exits: {target_exits} Target, {sl_exits} SL, {time_exits} Time | Avg Exit: {avg_exit_time}")
+        logger.info(f"📊 Data: {api_data_count} API, {estimated_data_count} Estimated | Avg Premium: ₹{avg_premium:.2f}")
         
         return results
 
@@ -2054,18 +2208,31 @@ DASHBOARD_HTML = """
                         <label class="info-text">Exit Time</label>
                         <input type="time" id="bt-exit-time" value="15:15">
                     </div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" id="bt-use-api" style="width: 20px; height: 20px;">
+                        <label class="info-text" for="bt-use-api">Use Breeze API Historical Data</label>
+                    </div>
                 </div>
-                <button class="btn btn-warning" onclick="runBacktest()" id="bt-run-btn">🚀 Run Backtest</button>
-                <span id="bt-loading" style="display:none; margin-left: 15px;">⏳ Running backtest...</span>
+                <div style="margin-bottom: 15px;">
+                    <button class="btn btn-warning" onclick="runBacktest()" id="bt-run-btn">🚀 Run Backtest</button>
+                    <span id="bt-loading" style="display:none; margin-left: 15px;">⏳ Running backtest...</span>
+                </div>
+                <p class="info-text" id="bt-data-note">💡 Premiums are estimated using Black-Scholes approximation. Enable "Use Breeze API" for real historical data (slower, requires API connection).</p>
                 
                 <div class="backtest-results" id="bt-results">
                     <h3 style="margin-bottom: 15px;">📊 Backtest Results</h3>
                     
-                    <!-- Timing Info -->
+                    <!-- Data Source & Timing Info -->
                     <div style="background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-bottom: 15px;">
-                        <span class="info-text">⏰ Entry: <strong id="bt-timing-entry">09:20 - 14:00</strong></span>
-                        <span class="info-text" style="margin-left: 20px;">🚪 Exit: <strong id="bt-timing-exit">15:15</strong></span>
-                        <span class="info-text" style="margin-left: 20px;">📦 Qty: <strong id="bt-timing-qty">75</strong></span>
+                        <div style="margin-bottom: 8px;">
+                            <span class="info-text">📊 Data Source: <strong id="bt-data-source">Estimated</strong></span>
+                            <span class="info-text" style="margin-left: 20px;">💰 Avg Premium: <strong id="bt-avg-premium">₹0</strong></span>
+                        </div>
+                        <div>
+                            <span class="info-text">⏰ Entry: <strong id="bt-timing-entry">09:20 - 14:00</strong></span>
+                            <span class="info-text" style="margin-left: 20px;">🚪 Exit: <strong id="bt-timing-exit">15:15</strong></span>
+                            <span class="info-text" style="margin-left: 20px;">📦 Qty: <strong id="bt-timing-qty">75</strong></span>
+                        </div>
                     </div>
                     
                     <!-- Summary Grid -->
@@ -2525,10 +2692,16 @@ DASHBOARD_HTML = """
             const entryStart = document.getElementById('bt-entry-start').value;
             const entryEnd = document.getElementById('bt-entry-end').value;
             const exitTime = document.getElementById('bt-exit-time').value;
+            const useHistoricalApi = document.getElementById('bt-use-api').checked;
             
             // Show loading
             document.getElementById('bt-run-btn').disabled = true;
             document.getElementById('bt-loading').style.display = 'inline';
+            if (useHistoricalApi) {
+                document.getElementById('bt-loading').textContent = '⏳ Fetching historical data from Breeze API (this may take a while)...';
+            } else {
+                document.getElementById('bt-loading').textContent = '⏳ Running backtest...';
+            }
             
             try {
                 const res = await fetch('/api/backtest', {
@@ -2541,7 +2714,8 @@ DASHBOARD_HTML = """
                         capital: parseFloat(capital),
                         entry_time_start: entryStart,
                         entry_time_end: entryEnd,
-                        exit_time: exitTime
+                        exit_time: exitTime,
+                        use_historical_api: useHistoricalApi
                     })
                 });
                 const data = await res.json();
@@ -2554,6 +2728,15 @@ DASHBOARD_HTML = """
                 document.getElementById('bt-return').textContent = (data.return_pct || 0).toFixed(2) + '%';
                 document.getElementById('bt-expiries').textContent = data.expiries_found || 0;
                 document.getElementById('bt-avg-exit').textContent = data.avg_exit_time || '--:--';
+                
+                // Data source info
+                const dataSource = data.data_source || {};
+                let sourceText = 'Estimated';
+                if (dataSource.use_historical_api) {
+                    sourceText = `API: ${dataSource.api_data || 0}, Est: ${dataSource.estimated_data || 0}`;
+                }
+                document.getElementById('bt-data-source').textContent = sourceText;
+                document.getElementById('bt-avg-premium').textContent = '₹' + (data.avg_premium || 0).toFixed(2);
                 
                 // Timing info
                 document.getElementById('bt-timing-entry').textContent = (data.entry_time_start || entryStart) + ' - ' + (data.entry_time_end || entryEnd);
@@ -2580,12 +2763,13 @@ DASHBOARD_HTML = """
                         const strategyName = (t.strategy || '').replace('_', ' ');
                         const exitClass = t.exit_reason === 'TARGET' ? 'positive' : 
                                          t.exit_reason === 'STOP_LOSS' ? 'negative' : '';
+                        const dataIcon = t.data_source === 'API' ? '📡' : '📊';
                         return `<tr>
                             <td>${t.entry_date || '-'}</td>
                             <td>${strategyName}</td>
                             <td>${t.entry_time || '-'}</td>
                             <td>${t.exit_time || '-'}</td>
-                            <td>₹${parseFloat(premium).toFixed(0)}</td>
+                            <td>${dataIcon} ₹${parseFloat(premium).toFixed(2)}</td>
                             <td class="${pnl >= 0 ? 'positive' : 'negative'}">₹${pnl.toLocaleString('en-IN', {maximumFractionDigits: 0})}</td>
                             <td class="${exitClass}">${t.exit_reason || '-'}</td>
                         </tr>`;
@@ -2798,12 +2982,16 @@ def api_backtest():
         entry_time_end = req.get("entry_time_end", ENTRY_TIME_END)
         exit_time = req.get("exit_time", EXIT_TIME)
         
+        # Historical API option
+        use_historical_api = req.get("use_historical_api", False)
+        
         backtester = Backtester()
         results = backtester.run_backtest(
             start_date, end_date, strategy, capital,
             entry_time_start=entry_time_start,
             entry_time_end=entry_time_end,
-            exit_time=exit_time
+            exit_time=exit_time,
+            use_historical_api=use_historical_api
         )
         
         return jsonify(results)

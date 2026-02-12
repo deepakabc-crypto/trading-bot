@@ -119,13 +119,26 @@ The bot includes a full backtesting engine accessible via the dashboard:
 
 ## 🔬 Backtesting
 
-The backtesting engine uses the **same entry/exit times** as the live trading bot:
+The backtesting engine uses the **same entry/exit times** as the live trading bot.
 
-### Features
-- **Entry Window**: Configurable entry time start and end
-- **Exit Time**: Force exit time for all positions
-- **Intraday Simulation**: Simulates price movement throughout the day
-- **Exit Breakdown**: Shows how many trades hit target, stop-loss, or time exit
+### Data Sources
+
+1. **Estimated Premiums** (Default) - Uses Black-Scholes approximation
+   - Fast, no API calls needed
+   - Good for strategy validation
+   - Premiums based on: spot, strike distance, days to expiry, IV
+
+2. **Breeze API Historical Data** (Optional) - Enable checkbox in dashboard
+   - Uses actual historical option prices
+   - More accurate but slower (API rate limits apply)
+   - Requires API connection and valid session
+
+### Premium Calculation (Estimated Mode)
+The backtester now uses proper option pricing:
+- Black-Scholes approximation for premium estimation
+- Days to expiry calculated from **trade date** (not current date!)
+- IV adjusts based on time to expiry
+- Realistic OTM decay and ITM intrinsic value
 
 ### Backtest Results Show:
 | Field | Description |
@@ -135,16 +148,18 @@ The backtesting engine uses the **same entry/exit times** as the live trading bo
 | Total P&L | Net profit/loss |
 | Return % | Return on initial capital |
 | Avg Exit Time | Average time of day for exits |
+| Avg Premium | Average entry premium collected |
+| Data Source | API or Estimated |
 | Target Hits | Trades that hit target |
 | Stop Loss | Trades that hit stop-loss |
 | Time Exits | Trades exited at force exit time |
 
-### Detailed Trade Log
+### Trade Details Table
 Each trade shows:
 - **Entry Date** - When the trade was entered
 - **Entry Time** - Actual entry time (random within window)
 - **Exit Time** - When the trade was closed
-- **Premium** - Entry premium collected
+- **Premium** - Entry premium (📡 = API data, 📊 = Estimated)
 - **P&L** - Profit/loss in ₹
 - **Exit Reason** - TARGET, STOP_LOSS, or TIME_EXIT
 
@@ -158,7 +173,8 @@ POST /api/backtest
   "capital": 500000,
   "entry_time_start": "09:20",
   "entry_time_end": "14:00",
-  "exit_time": "15:15"
+  "exit_time": "15:15",
+  "use_historical_api": false
 }
 ```
 
