@@ -40,29 +40,46 @@ API_SESSION = os.environ.get("API_SESSION", "") or os.environ.get("SESSION_TOKEN
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL = int(os.environ.get("CAPITAL", "500000"))
-QUANTITY = 65  # Nifty lot size
+QUANTITY = int(os.environ.get("QUANTITY", "65"))  # Nifty lot size (configurable)
 STRATEGY = os.environ.get("STRATEGY", "iron_condor")
 
 # Strategy settings
-IC_CALL_SELL_DISTANCE = 150
-IC_CALL_BUY_DISTANCE = 250
-IC_PUT_SELL_DISTANCE = 150
-IC_PUT_BUY_DISTANCE = 250
-IC_TARGET_PERCENT = 50
-IC_STOP_LOSS_PERCENT = 100
-STR_TARGET_PERCENT = 30
-STR_STOP_LOSS_PERCENT = 20
+IC_CALL_SELL_DISTANCE = int(os.environ.get("IC_CALL_SELL_DISTANCE", "150"))
+IC_CALL_BUY_DISTANCE = int(os.environ.get("IC_CALL_BUY_DISTANCE", "250"))
+IC_PUT_SELL_DISTANCE = int(os.environ.get("IC_PUT_SELL_DISTANCE", "150"))
+IC_PUT_BUY_DISTANCE = int(os.environ.get("IC_PUT_BUY_DISTANCE", "250"))
+IC_TARGET_PERCENT = int(os.environ.get("IC_TARGET_PERCENT", "50"))
+IC_STOP_LOSS_PERCENT = int(os.environ.get("IC_STOP_LOSS_PERCENT", "100"))
+STR_TARGET_PERCENT = int(os.environ.get("STR_TARGET_PERCENT", "30"))
+STR_STOP_LOSS_PERCENT = int(os.environ.get("STR_STOP_LOSS_PERCENT", "20"))
 
-# Timing
-ENTRY_TIME_START = "09:20"
-ENTRY_TIME_END = "14:00"
-EXIT_TIME = "15:15"
-TRADING_DAYS = [0, 1, 2, 3, 4]
-MIN_PREMIUM = 20  # Lowered from 30
-CHARGES_PER_LOT = 100
-CHECK_INTERVAL = 30
+# Timing (IST - Indian Standard Time)
+ENTRY_TIME_START = os.environ.get("ENTRY_TIME_START", "09:20")
+ENTRY_TIME_END = os.environ.get("ENTRY_TIME_END", "14:00")
+EXIT_TIME = os.environ.get("EXIT_TIME", "15:15")
+TRADING_DAYS = [0, 1, 2, 3, 4]  # Monday to Friday
+MIN_PREMIUM = int(os.environ.get("MIN_PREMIUM", "20"))
+CHARGES_PER_LOT = int(os.environ.get("CHARGES_PER_LOT", "100"))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
+
+# Auto-start trading
+AUTO_START = os.environ.get("AUTO_START", "true").lower() == "true"
 
 PORT = int(os.environ.get("PORT", 5000))
+
+# Timezone handling for IST
+try:
+    import pytz
+    IST = pytz.timezone('Asia/Kolkata')
+except:
+    IST = None
+    logger.warning("pytz not available - using system time")
+
+def get_ist_now():
+    """Get current time in IST"""
+    if IST:
+        return datetime.now(IST)
+    return datetime.now()
 
 # ============================================
 # DATA STORAGE - With Trade History Preservation
@@ -775,28 +792,75 @@ class ShortStraddle:
 # BOT RUNNER (Background Thread)
 # ============================================
 def is_trading_time():
-    now = datetime.now()
+    """Check if current time is within entry window (IST)"""
+    now = get_ist_now()
     if now.weekday() not in TRADING_DAYS:
         return False
-    start = datetime.strptime(ENTRY_TIME_START, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-    end = datetime.strptime(ENTRY_TIME_END, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-    return start <= now <= end
+    
+    current_time = now.strftime("%H:%M")
+    
+    # Compare as strings (HH:MM format)
+    in_window = ENTRY_TIME_START <= current_time <= ENTRY_TIME_END
+    
+    logger.debug(f"Trading time check: {current_time} IST, Window: {ENTRY_TIME_START}-{ENTRY_TIME_END}, In window: {in_window}")
+    return in_window
 
 def is_exit_time():
-    now = datetime.now()
-    exit_t = datetime.strptime(EXIT_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-    return now >= exit_t
+    """Check if current time is past exit time (IST)"""
+    now = get_ist_now()
+    current_time = now.strftime("%H:%M")
+    
+    is_exit = current_time >= EXIT_TIME
+    logger.debug(f"Exit time check: {current_time} IST >= {EXIT_TIME}, Should exit: {is_exit}")
+    return is_exit
+
+def is_market_hours():
+    """Check if market is open (9:15 AM - 3:30 PM IST)"""
+    now = get_ist_now()
+    if now.weekday() not in TRADING_DAYS:
+        return False
+    current_time = now.strftime("%H:%M")
+    return "09:15" <= current_time <= "15:30"
 
 def bot_thread():
     logger.info("🤖 Bot thread starting...")
+    logger.info(f"⏰ Entry Time: {ENTRY_TIME_START} - {ENTRY_TIME_END} IST")
+    logger.info(f"⏰ Exit Time: {EXIT_TIME} IST")
+    logger.info(f"📊 Strategy: {STRATEGY}")
+    logger.info(f"💰 Quantity: {QUANTITY} lots")
+    logger.info(f"🚀 Auto-start: {AUTO_START}")
+    
+    # Auto-start if enabled
+    if AUTO_START:
+        data = load_data()
+        if not data.get("bot_running"):
+            data["bot_running"] = True
+            save_data(data)
+            logger.info("✅ Bot auto-started")
+            telegram.send("🤖 Bot auto-started on deployment")
     
     api = BreezeAPI()
     ic = IronCondor(api)
     straddle = ShortStraddle(api)
     last_connect = datetime.now() - timedelta(hours=1)
+    last_status_log = datetime.now() - timedelta(minutes=5)
+    last_trade_date = None
     
     while True:
         try:
+            now = get_ist_now()
+            current_date = now.strftime("%Y-%m-%d")
+            current_time = now.strftime("%H:%M:%S")
+            
+            # Reset daily flags at midnight
+            if last_trade_date != current_date:
+                last_trade_date = current_date
+                # Reset daily P&L
+                data = load_data()
+                data["daily_pnl"] = 0
+                save_data(data)
+                logger.info(f"📅 New trading day: {current_date}")
+            
             # Check Telegram commands
             telegram.check_commands()
             
@@ -805,55 +869,94 @@ def bot_thread():
             strategy = data.get("strategy", STRATEGY)
             bot_running = data.get("bot_running", False)
             
+            # Log status every 5 minutes
+            if (datetime.now() - last_status_log).seconds >= 300:
+                market_status = "OPEN" if is_market_hours() else "CLOSED"
+                trading_window = "YES" if is_trading_time() else "NO"
+                logger.info(f"📊 Status: Bot={'ON' if bot_running else 'OFF'}, Market={market_status}, "
+                           f"Entry Window={trading_window}, Time={current_time} IST, "
+                           f"IC Position={bool(ic.position)}, Straddle Position={bool(straddle.position)}")
+                last_status_log = datetime.now()
+            
             if not bot_running:
                 time.sleep(10)
                 continue
             
-            # Connect to API if needed
-            if not api.connected and (datetime.now() - last_connect).seconds > 60:
-                api.connect()
-                last_connect = datetime.now()
-            
-            if not api.connected:
-                time.sleep(30)
+            # Connect to API if needed (only during market hours)
+            if is_market_hours():
+                if not api.connected and (datetime.now() - last_connect).seconds > 60:
+                    logger.info("🔌 Attempting API connection...")
+                    if api.connect():
+                        spot = api.get_spot()
+                        if spot:
+                            logger.info(f"📈 Nifty Spot: {spot}")
+                            telegram.send(f"📈 Connected! Nifty Spot: {spot}")
+                    last_connect = datetime.now()
+                
+                if not api.connected:
+                    logger.warning("❌ API not connected, waiting...")
+                    time.sleep(30)
+                    continue
+            else:
+                time.sleep(60)
                 continue
             
             # Force exit time
             if is_exit_time():
                 if ic.position:
+                    logger.info("⏰ Exit time reached - closing Iron Condor")
                     ic.exit("TIME_EXIT")
                 if straddle.position:
+                    logger.info("⏰ Exit time reached - closing Straddle")
                     straddle.exit("TIME_EXIT")
                 time.sleep(60)
                 continue
             
-            # Check exits
+            # Check exits for existing positions
             if strategy in ["iron_condor", "both"] and ic.position:
                 reason = ic.check_exit()
                 if reason:
+                    logger.info(f"🦅 IC exit triggered: {reason}")
                     ic.exit(reason)
             
             if strategy in ["straddle", "both"] and straddle.position:
                 reason = straddle.check_exit()
                 if reason:
+                    logger.info(f"📊 Straddle exit triggered: {reason}")
                     straddle.exit(reason)
             
-            # Enter new positions
+            # Enter new positions (during entry window)
             if is_trading_time():
                 spot = api.get_spot()
                 expiry = api.get_expiry()
                 
                 if spot:
-                    if strategy in ["iron_condor", "both"] and not ic.position:
-                        ic.enter(spot, expiry)
+                    logger.info(f"🎯 Entry window active. Spot: {spot}, Expiry: {expiry}")
                     
+                    # Enter Iron Condor if no position
+                    if strategy in ["iron_condor", "both"] and not ic.position:
+                        logger.info("🦅 Attempting Iron Condor entry...")
+                        if ic.enter(spot, expiry):
+                            logger.info("✅ Iron Condor position opened")
+                        else:
+                            logger.info("⚠️ Iron Condor entry skipped (low premium or API issue)")
+                    
+                    # Enter Straddle if no position
                     if strategy in ["straddle", "both"] and not straddle.position:
-                        straddle.enter(spot, expiry)
+                        logger.info("📊 Attempting Straddle entry...")
+                        if straddle.enter(spot, expiry):
+                            logger.info("✅ Straddle position opened")
+                        else:
+                            logger.info("⚠️ Straddle entry skipped (low premium or API issue)")
+                else:
+                    logger.warning("⚠️ Could not get spot price")
             
             time.sleep(CHECK_INTERVAL)
             
         except Exception as e:
-            logger.error(f"Bot error: {e}")
+            logger.error(f"❌ Bot error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             time.sleep(60)
 
 # ============================================
@@ -1008,6 +1111,11 @@ DASHBOARD_HTML = """
                 <span class="badge badge-offline" id="bot-badge">⏸️ STOPPED</span>
                 <span class="badge" id="strategy-badge">IRON CONDOR</span>
                 <span class="badge badge-session" id="session-badge">🔑 NO SESSION</span>
+            </div>
+            <div class="badges" style="margin-top: 10px;">
+                <span class="badge" id="time-badge" style="background: #333;">🕐 --:--:-- IST</span>
+                <span class="badge" id="market-badge" style="background: #666;">📊 MARKET CLOSED</span>
+                <span class="badge" id="window-badge" style="background: #666;">⏳ WAITING</span>
             </div>
         </div>
         
@@ -1218,6 +1326,37 @@ DASHBOARD_HTML = """
                     btn.classList.toggle('active', btn.dataset.strategy === data.strategy);
                 });
                 
+                // Fetch status for timing info
+                const statusRes = await fetch('/api/status');
+                const status = await statusRes.json();
+                
+                // Update time badge
+                const timeBadge = document.getElementById('time-badge');
+                timeBadge.textContent = '🕐 ' + status.current_time_ist.split(' ')[1] + ' IST';
+                
+                // Update market badge
+                const marketBadge = document.getElementById('market-badge');
+                if (status.is_market_hours) {
+                    marketBadge.textContent = '📊 MARKET OPEN';
+                    marketBadge.style.background = '#00c853';
+                } else {
+                    marketBadge.textContent = '📊 MARKET CLOSED';
+                    marketBadge.style.background = '#666';
+                }
+                
+                // Update window badge
+                const windowBadge = document.getElementById('window-badge');
+                if (status.is_exit_time) {
+                    windowBadge.textContent = '🔴 EXIT TIME';
+                    windowBadge.style.background = '#ff5252';
+                } else if (status.is_trading_time) {
+                    windowBadge.textContent = '🟢 ENTRY WINDOW (' + status.entry_time_start + '-' + status.entry_time_end + ')';
+                    windowBadge.style.background = '#00c853';
+                } else {
+                    windowBadge.textContent = '⏳ WAITING (Entry: ' + status.entry_time_start + ')';
+                    windowBadge.style.background = '#ff9800';
+                }
+                
                 const tradesRes = await fetch('/api/trades');
                 const trades = await tradesRes.json();
                 updateTable(trades);
@@ -1334,7 +1473,7 @@ DASHBOARD_HTML = """
         
         initChart();
         refreshData();
-        setInterval(refreshData, 30000);
+        setInterval(refreshData, 10000);  // Refresh every 10 seconds
     </script>
 </body>
 </html>
@@ -1432,6 +1571,51 @@ def api_expiries():
 @app.route('/health')
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+
+@app.route('/api/status')
+def api_status():
+    """Get detailed bot status including timing info"""
+    now = get_ist_now()
+    return jsonify({
+        "current_time_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "current_time_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_time_start": ENTRY_TIME_START,
+        "entry_time_end": ENTRY_TIME_END,
+        "exit_time": EXIT_TIME,
+        "is_trading_time": is_trading_time(),
+        "is_exit_time": is_exit_time(),
+        "is_market_hours": is_market_hours(),
+        "strategy": STRATEGY,
+        "quantity": QUANTITY,
+        "min_premium": MIN_PREMIUM,
+        "auto_start": AUTO_START,
+        "api_key_set": bool(API_KEY),
+        "api_secret_set": bool(API_SECRET),
+        "session_set": bool(API_SESSION),
+        "telegram_enabled": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    })
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    """Get or update bot settings"""
+    if request.method == 'GET':
+        return jsonify({
+            "entry_time_start": ENTRY_TIME_START,
+            "entry_time_end": ENTRY_TIME_END,
+            "exit_time": EXIT_TIME,
+            "strategy": STRATEGY,
+            "quantity": QUANTITY,
+            "min_premium": MIN_PREMIUM,
+            "ic_call_sell_distance": IC_CALL_SELL_DISTANCE,
+            "ic_call_buy_distance": IC_CALL_BUY_DISTANCE,
+            "ic_put_sell_distance": IC_PUT_SELL_DISTANCE,
+            "ic_put_buy_distance": IC_PUT_BUY_DISTANCE,
+            "ic_target_percent": IC_TARGET_PERCENT,
+            "ic_stop_loss_percent": IC_STOP_LOSS_PERCENT,
+            "str_target_percent": STR_TARGET_PERCENT,
+            "str_stop_loss_percent": STR_STOP_LOSS_PERCENT
+        })
+    return jsonify({"status": "settings are read-only, configure via environment variables"})
 
 # ============================================
 # MAIN

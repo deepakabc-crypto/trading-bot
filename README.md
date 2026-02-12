@@ -33,15 +33,52 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 
 ### Step 3: Add Environment Variables
 
+#### Required Variables
+
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `API_KEY` | ICICI Breeze API Key | abc123... |
 | `API_SECRET` | ICICI Breeze Secret | xyz789... |
 | `API_SESSION` | Breeze Session Token (daily) | abc123xyz... |
+
+#### Optional - Telegram
+
+| Variable | Description | Example |
+|----------|-------------|---------|
 | `TELEGRAM_BOT_TOKEN` | From @BotFather | 123456:ABC... |
 | `TELEGRAM_CHAT_ID` | Your chat ID | 987654321 |
+
+#### Optional - Trading Settings
+
+| Variable | Description | Default |
+|----------|-------------|---------|
 | `CAPITAL` | Trading capital | 500000 |
-| `STRATEGY` | Default strategy | iron_condor |
+| `QUANTITY` | Lot size | 65 |
+| `STRATEGY` | iron_condor / straddle / both | iron_condor |
+| `MIN_PREMIUM` | Minimum premium to enter | 20 |
+| `AUTO_START` | Auto-start bot on deploy | true |
+
+#### Optional - Timing (IST)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENTRY_TIME_START` | Start of entry window | 09:20 |
+| `ENTRY_TIME_END` | End of entry window | 14:00 |
+| `EXIT_TIME` | Force exit all positions | 15:15 |
+| `CHECK_INTERVAL` | Seconds between checks | 30 |
+
+#### Optional - Strategy Parameters
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `IC_CALL_SELL_DISTANCE` | IC: Call sell distance from ATM | 150 |
+| `IC_CALL_BUY_DISTANCE` | IC: Call buy distance from ATM | 250 |
+| `IC_PUT_SELL_DISTANCE` | IC: Put sell distance from ATM | 150 |
+| `IC_PUT_BUY_DISTANCE` | IC: Put buy distance from ATM | 250 |
+| `IC_TARGET_PERCENT` | IC: Target profit % | 50 |
+| `IC_STOP_LOSS_PERCENT` | IC: Stop loss % | 100 |
+| `STR_TARGET_PERCENT` | Straddle: Target profit % | 30 |
+| `STR_STOP_LOSS_PERCENT` | Straddle: Stop loss % | 20 |
 
 > **Note:** `API_SESSION` expires daily. You can update it via Telegram `/session TOKEN` or the dashboard.
 
@@ -83,6 +120,25 @@ POST /api/backtest
   "end_date": "2025-12-31",
   "strategy": "iron_condor",
   "capital": 500000
+}
+
+# Get bot status (timing, settings)
+GET /api/status
+
+# Get current settings
+GET /api/settings
+```
+
+### Example Status Response
+
+```json
+{
+  "current_time_ist": "2026-02-12 10:30:00",
+  "is_trading_time": true,
+  "is_market_hours": true,
+  "entry_time_start": "09:20",
+  "entry_time_end": "14:00",
+  "exit_time": "15:15"
 }
 ```
 
