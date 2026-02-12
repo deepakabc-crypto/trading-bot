@@ -68,7 +68,7 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | `ENTRY_TIME_START` | Start of entry window | 09:20 |
 | `ENTRY_TIME_END` | End of entry window | 14:00 |
 | `EXIT_TIME` | Force exit all positions | 15:15 |
-| `CHECK_INTERVAL` | Seconds between checks | 30 |
+| `CHECK_INTERVAL` | Seconds between bot checks | 60 |
 | `CUSTOM_EXPIRY` | Override expiry date (for holidays) | *(empty)* |
 | `USE_CURRENT_EXPIRY` | Use current week expiry on Thursday | false |
 | `EXPIRY_DAY_CUTOFF` | Time after which to use next expiry on Thursday | 09:30 |
@@ -223,6 +223,18 @@ Access via:
 - API: `GET /api/history`
 
 ## 🔧 Troubleshooting
+
+### "Limit exceed: API call per minute"
+The Breeze API has a limit of ~60 calls per minute. The bot now includes:
+- **Rate limiting** - Minimum 500ms between API calls
+- **LTP caching** - 5-second cache to avoid repeated calls
+- **Auto-wait** - Waits 60s when limit is detected
+- **Check interval** - Default increased to 60 seconds
+
+To reduce API calls further:
+```
+CHECK_INTERVAL=120  # Check every 2 minutes instead of 1
+```
 
 ### "Found 0 expiry dates"
 This error is now fixed! The backtester calculates expiry dates programmatically without API calls.

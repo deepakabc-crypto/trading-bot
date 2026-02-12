@@ -65,7 +65,7 @@ EXIT_TIME = os.environ.get("EXIT_TIME", "15:15")
 TRADING_DAYS = [0, 1, 2, 3, 4]  # Monday to Friday
 MIN_PREMIUM = int(os.environ.get("MIN_PREMIUM", "10"))  # Lowered to 10
 CHARGES_PER_LOT = int(os.environ.get("CHARGES_PER_LOT", "100"))
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # Increased to 60 seconds to avoid rate limits
 
 # Auto-start trading
 AUTO_START = os.environ.get("AUTO_START", "true").lower() == "true"
@@ -402,6 +402,58 @@ class BreezeAPI:
     def __init__(self):
         self.breeze = None
         self.connected = False
+        self.last_call_time = 0
+        self.min_call_interval = 0.5  # Minimum 500ms between API calls
+        self.ltp_cache = {}  # Cache for LTP values
+        self.cache_ttl = 5  # Cache TTL in seconds
+        self.calls_per_minute = 0
+        self.last_minute_reset = time.time()
+        self.max_calls_per_minute = 45  # Stay well under limit
+    
+    def _rate_limit(self):
+        """Enforce rate limiting between API calls"""
+        current_time = time.time()
+        
+        # Reset minute counter
+        if current_time - self.last_minute_reset >= 60:
+            self.calls_per_minute = 0
+            self.last_minute_reset = current_time
+        
+        # Check if we're approaching the limit
+        if self.calls_per_minute >= self.max_calls_per_minute:
+            wait_time = 60 - (current_time - self.last_minute_reset)
+            if wait_time > 0:
+                logger.warning(f"⏳ Rate limit approaching ({self.calls_per_minute} calls), waiting {wait_time:.0f}s...")
+                time.sleep(wait_time + 2)
+                self.calls_per_minute = 0
+                self.last_minute_reset = time.time()
+        
+        # Ensure minimum interval between calls
+        elapsed = current_time - self.last_call_time
+        if elapsed < self.min_call_interval:
+            time.sleep(self.min_call_interval - elapsed)
+        
+        self.last_call_time = time.time()
+        self.calls_per_minute += 1
+    
+    def _get_cache_key(self, strike, option_type, expiry):
+        """Generate cache key for LTP"""
+        exp_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else str(expiry)[:10]
+        return f"{strike}_{option_type}_{exp_str}"
+    
+    def _get_cached_ltp(self, strike, option_type, expiry):
+        """Get LTP from cache if valid"""
+        key = self._get_cache_key(strike, option_type, expiry)
+        if key in self.ltp_cache:
+            cached_time, cached_value = self.ltp_cache[key]
+            if time.time() - cached_time < self.cache_ttl:
+                return cached_value
+        return None
+    
+    def _set_cached_ltp(self, strike, option_type, expiry, value):
+        """Set LTP in cache"""
+        key = self._get_cache_key(strike, option_type, expiry)
+        self.ltp_cache[key] = (time.time(), value)
         
     def connect(self):
         if not BREEZE_AVAILABLE:
@@ -431,31 +483,47 @@ class BreezeAPI:
         if not self.connected:
             return None
         try:
+            self._rate_limit()
             data = self.breeze.get_quotes(stock_code="NIFTY", exchange_code="NSE", product_type="cash")
-            if data and 'Success' in data:
+            
+            # Check for rate limit error
+            if data and data.get('Status') == 5:
+                logger.warning("⚠️ Rate limit hit on get_spot, waiting 60s...")
+                time.sleep(60)
+                self.calls_per_minute = 0
+                return None
+            
+            if data and 'Success' in data and data['Success']:
                 return float(data['Success'][0]['ltp'])
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Spot error: {e}")
         return None
     
     def get_ltp(self, strike, option_type, expiry):
-        """Get LTP for an option with multiple expiry format attempts"""
+        """Get LTP for an option with caching and rate limiting"""
         if not self.connected:
             return None
+        
+        # Check cache first
+        cached = self._get_cached_ltp(strike, option_type, expiry)
+        if cached is not None:
+            logger.debug(f"📦 Cache hit: {strike}{option_type.upper()} = {cached}")
+            return cached
         
         # Try multiple expiry formats
         expiry_formats = []
         if isinstance(expiry, datetime):
             expiry_formats = [
-                format_expiry_for_breeze(expiry),  # 2026-02-13T07:00:00.000Z
-                format_expiry_breeze_alt(expiry),   # 13-Feb-2026
-                expiry.strftime("%Y-%m-%d"),        # 2026-02-13
+                format_expiry_for_breeze(expiry),  # 2026-02-17T07:00:00.000Z
+                format_expiry_breeze_alt(expiry),   # 17-Feb-2026
             ]
         elif isinstance(expiry, str):
             expiry_formats = [expiry]
         
         for exp_fmt in expiry_formats:
             try:
+                self._rate_limit()
+                
                 data = self.breeze.get_quotes(
                     stock_code="NIFTY", 
                     exchange_code="NFO", 
@@ -465,32 +533,44 @@ class BreezeAPI:
                     strike_price=str(strike)
                 )
                 
+                # Check for rate limit error
+                if data and data.get('Status') == 5:
+                    logger.warning(f"⚠️ Rate limit hit, waiting 60s...")
+                    time.sleep(60)
+                    self.calls_per_minute = 0
+                    continue
+                
                 # Check for success
                 if data and data.get('Success'):
                     ltp = float(data['Success'][0]['ltp'])
                     if ltp > 0:
-                        logger.debug(f"✅ Got LTP {ltp} for {strike}{option_type.upper()} exp={exp_fmt}")
+                        logger.debug(f"✅ Got LTP {ltp} for {strike}{option_type.upper()}")
+                        self._set_cached_ltp(strike, option_type, expiry, ltp)
                         return ltp
                 
                 # Check for error
                 if data and data.get('Error'):
-                    logger.debug(f"API Error for {strike}{option_type.upper()} exp={exp_fmt}: {data.get('Error')}")
+                    if 'Limit exceed' in str(data.get('Error', '')):
+                        logger.warning(f"⚠️ Rate limit in response, waiting 60s...")
+                        time.sleep(60)
+                        self.calls_per_minute = 0
+                    else:
+                        logger.debug(f"API Error for {strike}{option_type.upper()}: {data.get('Error')}")
                     
             except Exception as e:
-                logger.debug(f"LTP error for {strike}{option_type.upper()} exp={exp_fmt}: {e}")
+                logger.debug(f"LTP error for {strike}{option_type.upper()}: {e}")
         
-        logger.warning(f"❌ No data found for {strike}{option_type.upper()}, tried expiries: {expiry_formats}")
         return None
     
-    def get_ltp_with_retry(self, strike, option_type, expiry, retries=3):
-        """Get LTP with retry logic"""
-        import time
+    def get_ltp_with_retry(self, strike, option_type, expiry, retries=2):
+        """Get LTP with retry logic and delays"""
         for attempt in range(retries):
             ltp = self.get_ltp(strike, option_type, expiry)
             if ltp is not None and ltp > 0:
                 return ltp
             if attempt < retries - 1:
-                time.sleep(1)  # Wait 1 second before retry
+                logger.debug(f"Retry {attempt + 1} for {strike}{option_type.upper()}")
+                time.sleep(3)  # Wait 3 seconds before retry
         return None
     
     def get_historical_data(self, strike, option_type, expiry, from_date, to_date, interval="1day"):
@@ -773,17 +853,18 @@ class IronCondor:
         logger.info(f"🦅 IC Setup: ATM={atm}, Strikes: SC={sc}, BC={bc}, SP={sp}, BP={bp}")
         logger.info(f"🦅 IC Expiry: {expiry_display}")
         
-        # Get LTPs with retry
-        logger.info(f"📊 Fetching premiums for {sc}CE...")
+        # Get all LTPs with delays between calls to avoid rate limits
+        logger.info(f"📊 Fetching premiums (with rate limiting)...")
+        
         sc_p = self.api.get_ltp_with_retry(sc, "call", expiry) or 0
+        time.sleep(1)  # Delay between calls
         
-        logger.info(f"📊 Fetching premiums for {bc}CE...")
         bc_p = self.api.get_ltp_with_retry(bc, "call", expiry) or 0
+        time.sleep(1)
         
-        logger.info(f"📊 Fetching premiums for {sp}PE...")
         sp_p = self.api.get_ltp_with_retry(sp, "put", expiry) or 0
+        time.sleep(1)
         
-        logger.info(f"📊 Fetching premiums for {bp}PE...")
         bp_p = self.api.get_ltp_with_retry(bp, "put", expiry) or 0
         
         # Log premiums
@@ -948,11 +1029,10 @@ class ShortStraddle:
         expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
         logger.info(f"📊 Straddle Setup: ATM={atm}, Expiry={expiry_display}")
         
-        # Get LTPs with retry
-        logger.info(f"📊 Fetching premium for {atm}CE...")
+        # Get LTPs with delays to avoid rate limits
+        logger.info(f"📊 Fetching premiums (with rate limiting)...")
         ce = self.api.get_ltp_with_retry(atm, "call", expiry) or 0
-        
-        logger.info(f"📊 Fetching premium for {atm}PE...")
+        time.sleep(1)  # Delay between calls
         pe = self.api.get_ltp_with_retry(atm, "put", expiry) or 0
         
         logger.info(f"📊 Premiums: CE={ce}, PE={pe}")
@@ -2279,7 +2359,7 @@ DASHBOARD_HTML = """
         
         initChart();
         refreshData();
-        setInterval(refreshData, 5000);  // Refresh every 5 seconds for live P&L
+        setInterval(refreshData, 15000);  // Refresh every 15 seconds to reduce API load
     </script>
 </body>
 </html>
