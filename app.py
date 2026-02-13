@@ -60,6 +60,40 @@ IC_STOP_LOSS_PERCENT = int(os.environ.get("IC_STOP_LOSS_PERCENT", "100"))
 STR_TARGET_PERCENT = int(os.environ.get("STR_TARGET_PERCENT", "30"))
 STR_STOP_LOSS_PERCENT = int(os.environ.get("STR_STOP_LOSS_PERCENT", "20"))
 
+# === IMPROVED IC SETTINGS ===
+# VIX-based entry filter (skip trades when volatility is too high)
+IC_VIX_MAX = float(os.environ.get("IC_VIX_MAX", "16"))           # Don't enter IC if India VIX > this
+IC_VIX_MIN = float(os.environ.get("IC_VIX_MIN", "9"))            # Don't enter IC if India VIX < this (too cheap premiums)
+
+# Dynamic strike selection mode: "fixed" (original) or "delta" (OI/premium based)
+IC_STRIKE_MODE = os.environ.get("IC_STRIKE_MODE", "fixed")       # "fixed" or "dynamic"
+IC_MIN_CREDIT = float(os.environ.get("IC_MIN_CREDIT", "20"))     # Minimum net credit to enter IC
+
+# Per-leg stop loss: exit threatened side independently
+IC_LEG_SL_ENABLED = os.environ.get("IC_LEG_SL_ENABLED", "true").lower() == "true"
+IC_LEG_SL_PERCENT = int(os.environ.get("IC_LEG_SL_PERCENT", "150"))  # Exit a spread when it loses 150% of its credit
+
+# Trailing stop: lock in profits as trade moves favorably
+IC_TRAILING_SL = os.environ.get("IC_TRAILING_SL", "true").lower() == "true"
+IC_TRAILING_ACTIVATE_PCT = int(os.environ.get("IC_TRAILING_ACTIVATE_PCT", "30"))  # Activate trailing SL after 30% profit
+IC_TRAILING_OFFSET_PCT = int(os.environ.get("IC_TRAILING_OFFSET_PCT", "15"))      # Trail 15% behind peak profit
+
+# Re-entry after stop loss (don't re-enter same day after SL hit)
+IC_REENTRY_AFTER_SL = os.environ.get("IC_REENTRY_AFTER_SL", "false").lower() == "true"
+
+# Spot proximity adjustment: widen strikes if spot is near day's high/low
+IC_SPOT_BUFFER = os.environ.get("IC_SPOT_BUFFER", "true").lower() == "true"
+
+# Expiry day avoidance: don't open new IC on expiry day (high gamma risk)
+IC_AVOID_EXPIRY_DAY = os.environ.get("IC_AVOID_EXPIRY_DAY", "true").lower() == "true"
+
+# Adjustment mode: close threatened spread instead of full exit
+IC_ADJUSTMENT_ENABLED = os.environ.get("IC_ADJUSTMENT_ENABLED", "true").lower() == "true"
+IC_ADJUSTMENT_TRIGGER_PCT = int(os.environ.get("IC_ADJUSTMENT_TRIGGER_PCT", "70"))  # Adjust when one spread loses 70% of total credit
+
+# Daily loss limit: stop trading if daily realized loss exceeds this
+IC_DAILY_LOSS_LIMIT = float(os.environ.get("IC_DAILY_LOSS_LIMIT", "0"))  # 0 = disabled. E.g. 5000 = stop after ₹5000 daily loss
+
 # Timing (IST - Indian Standard Time)
 ENTRY_TIME_START = os.environ.get("ENTRY_TIME_START", "09:20")
 ENTRY_TIME_END = os.environ.get("ENTRY_TIME_END", "14:00")
@@ -68,11 +102,6 @@ TRADING_DAYS = [0, 1, 2, 3, 4]  # Monday to Friday
 MIN_PREMIUM = int(os.environ.get("MIN_PREMIUM", "10"))  # Lowered to 10
 CHARGES_PER_LOT = int(os.environ.get("CHARGES_PER_LOT", "100"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # Increased to 60 seconds to avoid rate limits
-
-# Basket order settings
-BASKET_ORDER = os.environ.get("BASKET_ORDER", "true").lower() == "true"  # Use basket order (concurrent multi-leg placement)
-BASKET_RETRY = int(os.environ.get("BASKET_RETRY", "2"))  # Retries per leg in basket
-BASKET_ROLLBACK = os.environ.get("BASKET_ROLLBACK", "true").lower() == "true"  # Auto-rollback failed basket orders
 
 # Auto-start trading
 AUTO_START = os.environ.get("AUTO_START", "true").lower() == "true"
@@ -636,7 +665,6 @@ class BreezeAPI:
             if isinstance(expiry, datetime):
                 expiry = format_expiry_for_breeze(expiry)
                 
-            self._rate_limit()
             order = self.breeze.place_order(
                 stock_code="NIFTY", exchange_code="NFO", product="options",
                 action=side.lower(), order_type="market", quantity=str(quantity),
@@ -645,186 +673,11 @@ class BreezeAPI:
                 stoploss="", disclosed_quantity=""
             )
             if order and 'Success' in order:
-                order_id = order['Success'].get('order_id', 'unknown')
-                logger.info(f"✅ Order placed: {side} {quantity}x {strike}{option_type.upper()} → {order_id}")
-                return order_id
-            elif order and order.get('Error'):
-                logger.error(f"❌ Order rejected: {side} {strike}{option_type.upper()} → {order.get('Error')}")
+                logger.info(f"Order: {side} {strike} {option_type}")
+                return order['Success']['order_id']
         except Exception as e:
             logger.error(f"Order error: {e}")
         return None
-    
-    def place_basket_order(self, legs: list, expiry, quantity: int) -> dict:
-        """
-        Place multiple option legs as a basket order (concurrent execution).
-        
-        Breeze API does not have a native basket_order endpoint, so this method:
-        1. Pre-validates all legs with margin_calculator (if available)
-        2. Places all legs in rapid succession with minimal delay
-        3. Tracks order IDs for each leg
-        4. Rolls back (reverses) successful legs if any critical leg fails
-        
-        Args:
-            legs: List of dicts with keys: strike, option_type, side
-                  e.g. [{"strike": 23000, "option_type": "call", "side": "sell", "label": "SC"}, ...]
-            expiry: Expiry datetime or string
-            quantity: Quantity per leg
-        
-        Returns:
-            dict with keys: success (bool), order_ids (dict), failed_legs (list),
-                           margin_required (float), rolled_back (bool)
-        """
-        result = {
-            "success": False,
-            "order_ids": {},
-            "failed_legs": [],
-            "margin_required": None,
-            "rolled_back": False,
-            "total_legs": len(legs),
-            "placed_legs": 0
-        }
-        
-        if not self.connected or not legs:
-            logger.error("🧺 Basket order failed: API not connected or empty legs")
-            return result
-        
-        # Format expiry once
-        expiry_str = format_expiry_for_breeze(expiry) if isinstance(expiry, datetime) else expiry
-        expiry_alt = format_expiry_breeze_alt(expiry) if isinstance(expiry, datetime) else expiry
-        
-        # Step 1: Pre-check margin using margin_calculator
-        margin_required = self._check_basket_margin(legs, expiry_alt, quantity)
-        result["margin_required"] = margin_required
-        if margin_required:
-            logger.info(f"🧺 Basket margin required: ₹{margin_required:,.0f}")
-        
-        # Step 2: Place all legs rapidly
-        logger.info(f"🧺 Placing basket order: {len(legs)} legs, Qty={quantity}")
-        
-        successful_orders = {}  # label -> order_id
-        failed_orders = []      # labels of failed legs
-        
-        for leg in legs:
-            strike = leg["strike"]
-            opt_type = leg["option_type"]
-            side = leg["side"]
-            label = leg.get("label", f"{strike}{opt_type[0].upper()}")
-            
-            # Try placing with retry
-            order_id = None
-            for attempt in range(BASKET_RETRY):
-                order_id = self.place_order(strike, opt_type, expiry_str, quantity, side, 0)
-                if order_id:
-                    break
-                if attempt < BASKET_RETRY - 1:
-                    logger.warning(f"🧺 Retry {attempt + 1} for {label}")
-                    time.sleep(1)
-            
-            if order_id:
-                successful_orders[label] = order_id
-                result["placed_legs"] += 1
-                logger.info(f"🧺 ✅ {label}: {side.upper()} {strike}{opt_type.upper()} → {order_id}")
-            else:
-                failed_orders.append(label)
-                logger.error(f"🧺 ❌ {label}: {side.upper()} {strike}{opt_type.upper()} FAILED")
-        
-        result["order_ids"] = successful_orders
-        result["failed_legs"] = failed_orders
-        
-        # Step 3: Evaluate success and rollback if needed
-        if not failed_orders:
-            # All legs placed successfully
-            result["success"] = True
-            logger.info(f"🧺 ✅ Basket order complete: {len(successful_orders)}/{len(legs)} legs placed")
-            telegram.send(f"🧺 <b>Basket Order Placed</b>\n{len(successful_orders)} legs executed successfully")
-        else:
-            # Some legs failed
-            logger.error(f"🧺 ⚠️ Basket order partial: {len(successful_orders)}/{len(legs)} legs placed, "
-                        f"{len(failed_orders)} failed: {failed_orders}")
-            
-            # Rollback if enabled and if we have some successful orders
-            if BASKET_ROLLBACK and successful_orders:
-                logger.warning(f"🧺 🔄 Rolling back {len(successful_orders)} successful legs...")
-                self._rollback_basket(successful_orders, legs, expiry_str, quantity)
-                result["rolled_back"] = True
-                result["success"] = False
-                telegram.send(f"🧺 ❌ <b>Basket Order Failed & Rolled Back</b>\n"
-                            f"Failed legs: {', '.join(failed_orders)}\n"
-                            f"Rolled back: {', '.join(successful_orders.keys())}")
-            else:
-                # Partial fill - keep what we got
-                result["success"] = len(successful_orders) > 0
-                telegram.send(f"🧺 ⚠️ <b>Basket Order Partial</b>\n"
-                            f"Placed: {len(successful_orders)}/{len(legs)} legs\n"
-                            f"Failed: {', '.join(failed_orders)}")
-        
-        return result
-    
-    def _check_basket_margin(self, legs: list, expiry: str, quantity: int) -> float:
-        """Check combined margin requirement for a basket of option legs using margin_calculator"""
-        if not self.connected:
-            return None
-        try:
-            positions = []
-            for leg in legs:
-                positions.append({
-                    "strike_price": str(leg["strike"]),
-                    "quantity": str(quantity),
-                    "right": leg["option_type"].capitalize(),
-                    "product": "options",
-                    "action": leg["side"].capitalize(),
-                    "price": "0",
-                    "expiry_date": expiry,
-                    "stock_code": "NIFTY",
-                    "cover_order_flow": "N",
-                    "fresh_order_type": "N",
-                    "cover_limit_rate": "0",
-                    "cover_sltp_price": "0",
-                    "fresh_limit_rate": "0",
-                    "open_quantity": "0"
-                })
-            
-            self._rate_limit()
-            result = self.breeze.margin_calculator(positions)
-            
-            if result and result.get('Success'):
-                span = float(result['Success'].get('span_margin_required', 0))
-                non_span = float(result['Success'].get('non_span_margin_required', 0))
-                total_margin = span + non_span
-                logger.info(f"🧺 Margin: SPAN=₹{span:,.0f}, Non-SPAN=₹{non_span:,.0f}, Total=₹{total_margin:,.0f}")
-                return total_margin
-            elif result and result.get('Error'):
-                logger.warning(f"🧺 Margin check error: {result.get('Error')}")
-        except Exception as e:
-            logger.warning(f"🧺 Margin calculator not available: {e}")
-        return None
-    
-    def _rollback_basket(self, successful_orders: dict, original_legs: list, expiry: str, quantity: int):
-        """Rollback successful basket orders by placing reverse orders"""
-        # Build reverse mapping: label -> original leg
-        leg_map = {}
-        for leg in original_legs:
-            label = leg.get("label", f"{leg['strike']}{leg['option_type'][0].upper()}")
-            leg_map[label] = leg
-        
-        for label, order_id in successful_orders.items():
-            leg = leg_map.get(label)
-            if not leg:
-                continue
-            
-            # Reverse the side
-            reverse_side = "buy" if leg["side"].lower() == "sell" else "sell"
-            
-            logger.info(f"🧺 🔄 Reversing {label}: {reverse_side.upper()} {leg['strike']}{leg['option_type'].upper()}")
-            reverse_id = self.place_order(leg["strike"], leg["option_type"], expiry, quantity, reverse_side, 0)
-            
-            if reverse_id:
-                logger.info(f"🧺 ✅ Rollback {label} successful → {reverse_id}")
-            else:
-                logger.error(f"🧺 ❌ Rollback {label} FAILED - MANUAL INTERVENTION NEEDED!")
-                telegram.send(f"🚨 ALERT: Rollback failed for {label}! Manual square-off needed.")
-            
-            time.sleep(0.5)  # Small delay between rollback orders
     
     def get_expiry(self):
         """Get next expiry date for live trading"""
@@ -836,6 +689,45 @@ class BreezeAPI:
     def get_expiry_str(self):
         """Get next expiry date as formatted string"""
         return format_expiry_for_breeze(get_next_expiry())
+    
+    def get_vix(self):
+        """Get India VIX value via Nifty VIX quote"""
+        if not self.connected:
+            return None
+        try:
+            self._rate_limit()
+            # India VIX stock code is INDIA VIX / NIFVIX on NSE
+            data = self.breeze.get_quotes(stock_code="INDVIX", exchange_code="NSE", product_type="cash")
+            if data and data.get('Success') and data['Success']:
+                return float(data['Success'][0].get('ltp', 0))
+        except:
+            pass
+        
+        # Fallback: try via historical data
+        try:
+            self._rate_limit()
+            data = self.breeze.get_quotes(stock_code="NIFVIX", exchange_code="NSE", product_type="cash")
+            if data and data.get('Success') and data['Success']:
+                return float(data['Success'][0].get('ltp', 0))
+        except:
+            pass
+        
+        logger.debug("Could not fetch India VIX")
+        return None
+    
+    def get_spot_range(self):
+        """Get today's Nifty high/low to gauge intraday range"""
+        if not self.connected:
+            return None, None
+        try:
+            self._rate_limit()
+            data = self.breeze.get_quotes(stock_code="NIFTY", exchange_code="NSE", product_type="cash")
+            if data and data.get('Success') and data['Success']:
+                quote = data['Success'][0]
+                return float(quote.get('high', 0)), float(quote.get('low', 0))
+        except:
+            pass
+        return None, None
 
 # ============================================
 # BACKTESTING ENGINE
@@ -1307,7 +1199,7 @@ class Backtester:
         return results
 
 # ============================================
-# IRON CONDOR STRATEGY
+# IRON CONDOR STRATEGY (Improved v2.0)
 # ============================================
 class IronCondor:
     def __init__(self, api):
@@ -1317,27 +1209,201 @@ class IronCondor:
         self.entry_prices = {}
         self.entry_time = None
         self.spot_at_entry = None
-        self.order_ids = {}
+        self.call_credit = 0
+        self.put_credit = 0
+        self.peak_pnl_pct = 0       # Track peak P&L % for trailing stop
+        self.sl_hit_today = False     # Track if SL was hit today (prevent re-entry)
+        self.sl_hit_date = None
+        self.call_spread_closed = False  # Track partial exit (adjustment)
+        self.put_spread_closed = False
+        self.vix_at_entry = None
+        self.day_high_at_entry = None
+        self.day_low_at_entry = None
+    
+    def _check_vix_filter(self) -> tuple:
+        """Check if India VIX is within acceptable range for IC entry.
+        Returns (ok: bool, vix: float|None, reason: str)"""
+        vix = self.api.get_vix()
+        if vix is None:
+            logger.info("🦅 VIX data unavailable - proceeding without VIX filter")
+            return True, None, "VIX unavailable"
+        
+        if vix > IC_VIX_MAX:
+            return False, vix, f"VIX {vix:.1f} > {IC_VIX_MAX} (too volatile)"
+        if vix < IC_VIX_MIN:
+            return False, vix, f"VIX {vix:.1f} < {IC_VIX_MIN} (premiums too cheap)"
+        
+        return True, vix, f"VIX {vix:.1f} OK"
+    
+    def _check_expiry_day(self, expiry) -> bool:
+        """Check if today is expiry day - avoid opening new IC"""
+        if not IC_AVOID_EXPIRY_DAY:
+            return True  # Check disabled
+        
+        now = get_ist_now()
+        if hasattr(now, 'tzinfo') and now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        
+        if isinstance(expiry, datetime):
+            is_expiry_day = now.date() == expiry.date()
+        else:
+            is_expiry_day = False
+        
+        if is_expiry_day:
+            logger.info("🦅 Skipping IC entry on expiry day (high gamma risk)")
+            return False
+        return True
+    
+    def _select_dynamic_strikes(self, spot, expiry):
+        """Select strikes dynamically based on option chain OI and premiums.
+        Falls back to fixed distances if option chain unavailable."""
+        
+        # Try to get option chain for smarter strike selection
+        chain = self.api.get_option_chain(expiry)
+        if not chain:
+            logger.info("🦅 Option chain unavailable, using fixed strike distances")
+            return None
+        
+        try:
+            atm = round(spot / 50) * 50
+            
+            # Parse option chain into calls and puts
+            calls = {}
+            puts = {}
+            for item in chain:
+                strike = int(float(item.get('strike_price', 0)))
+                right = item.get('right', '').lower()
+                oi = int(item.get('open_interest', 0))
+                ltp = float(item.get('ltp', 0))
+                
+                if right == 'call' and strike > atm:
+                    calls[strike] = {"oi": oi, "ltp": ltp}
+                elif right == 'put' and strike < atm:
+                    puts[strike] = {"oi": oi, "ltp": ltp}
+            
+            # Find sell strikes: highest OI strikes within 100-300 points from ATM
+            # High OI indicates strong resistance/support → good sell strikes
+            best_call_sell = None
+            best_call_oi = 0
+            for strike in sorted(calls.keys()):
+                dist = strike - atm
+                if 100 <= dist <= 300 and calls[strike]["oi"] > best_call_oi and calls[strike]["ltp"] >= 5:
+                    best_call_oi = calls[strike]["oi"]
+                    best_call_sell = strike
+            
+            best_put_sell = None
+            best_put_oi = 0
+            for strike in sorted(puts.keys(), reverse=True):
+                dist = atm - strike
+                if 100 <= dist <= 300 and puts[strike]["oi"] > best_put_oi and puts[strike]["ltp"] >= 5:
+                    best_put_oi = puts[strike]["oi"]
+                    best_put_sell = strike
+            
+            if best_call_sell and best_put_sell:
+                # Buy strikes: 100 points beyond sell strikes
+                sc = best_call_sell
+                bc = sc + 100
+                sp = best_put_sell
+                bp = sp - 100
+                
+                logger.info(f"🦅 Dynamic strikes (OI-based): SC={sc} (OI:{best_call_oi}), SP={sp} (OI:{best_put_oi})")
+                return {"sc": sc, "bc": bc, "sp": sp, "bp": bp}
+        except Exception as e:
+            logger.debug(f"Dynamic strike selection error: {e}")
+        
+        return None
+    
+    def _apply_spot_buffer(self, spot, sc, bc, sp, bp):
+        """Widen strikes if spot is near day's high/low (trending market)"""
+        if not IC_SPOT_BUFFER:
+            return sc, bc, sp, bp
+        
+        day_high, day_low = self.api.get_spot_range()
+        if not day_high or not day_low:
+            return sc, bc, sp, bp
+        
+        self.day_high_at_entry = day_high
+        self.day_low_at_entry = day_low
+        day_range = day_high - day_low
+        
+        # If spot is in upper 25% of day's range, widen call side
+        if day_range > 50:
+            spot_position = (spot - day_low) / day_range  # 0=at low, 1=at high
+            
+            if spot_position > 0.75:
+                # Spot near day high - widen call strikes by 50 points
+                sc += 50
+                bc += 50
+                logger.info(f"🦅 Spot near day high ({spot_position:.0%}) - widened call strikes by 50pts")
+            elif spot_position < 0.25:
+                # Spot near day low - widen put strikes by 50 points
+                sp -= 50
+                bp -= 50
+                logger.info(f"🦅 Spot near day low ({spot_position:.0%}) - widened put strikes by 50pts")
+        
+        return sc, bc, sp, bp
         
     def enter(self, spot, expiry):
+        # === PRE-ENTRY CHECKS ===
+        
+        # Check if SL was already hit today (prevent re-entry)
+        if not IC_REENTRY_AFTER_SL and self.sl_hit_today:
+            now = get_ist_now()
+            if self.sl_hit_date and now.strftime("%Y-%m-%d") == self.sl_hit_date:
+                logger.info("🦅 IC skipped: SL already hit today, no re-entry")
+                return False
+            else:
+                self.sl_hit_today = False  # New day, reset
+        
+        # Check VIX filter
+        vix_ok, vix, vix_reason = self._check_vix_filter()
+        if not vix_ok:
+            logger.info(f"🦅 IC skipped: {vix_reason}")
+            telegram.send(f"🦅 IC Entry skipped\n{vix_reason}")
+            return False
+        
+        # Check expiry day filter
+        if not self._check_expiry_day(expiry):
+            telegram.send(f"🦅 IC Entry skipped\nExpiry day - gamma risk too high")
+            return False
+        
+        # === STRIKE SELECTION ===
         atm = round(spot / 50) * 50
-        sc, bc = atm + IC_CALL_SELL_DISTANCE, atm + IC_CALL_BUY_DISTANCE
-        sp, bp = atm - IC_PUT_SELL_DISTANCE, atm - IC_PUT_BUY_DISTANCE
+        
+        # Try dynamic strike selection first
+        if IC_STRIKE_MODE == "dynamic":
+            dynamic_strikes = self._select_dynamic_strikes(spot, expiry)
+            if dynamic_strikes:
+                sc = dynamic_strikes["sc"]
+                bc = dynamic_strikes["bc"]
+                sp = dynamic_strikes["sp"]
+                bp = dynamic_strikes["bp"]
+            else:
+                sc, bc = atm + IC_CALL_SELL_DISTANCE, atm + IC_CALL_BUY_DISTANCE
+                sp, bp = atm - IC_PUT_SELL_DISTANCE, atm - IC_PUT_BUY_DISTANCE
+        else:
+            sc, bc = atm + IC_CALL_SELL_DISTANCE, atm + IC_CALL_BUY_DISTANCE
+            sp, bp = atm - IC_PUT_SELL_DISTANCE, atm - IC_PUT_BUY_DISTANCE
+        
+        # Apply spot buffer (widen if near day's high/low)
+        sc, bc, sp, bp = self._apply_spot_buffer(spot, sc, bc, sp, bp)
         
         # Log what we're trying to do
         expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
         logger.info(f"🦅 IC Setup: ATM={atm}, Strikes: SC={sc}, BC={bc}, SP={sp}, BP={bp}")
-        logger.info(f"🦅 IC Expiry: {expiry_display}")
+        logger.info(f"🦅 IC Expiry: {expiry_display}, VIX: {vix}")
         
-        # Get all LTPs with delays between calls to avoid rate limits
+        # === FETCH PREMIUMS ===
         logger.info(f"📊 Fetching premiums (with rate limiting)...")
         
         sc_p = self.api.get_ltp_with_retry(sc, "call", expiry) or 0
+        time.sleep(1)
         bc_p = self.api.get_ltp_with_retry(bc, "call", expiry) or 0
+        time.sleep(1)
         sp_p = self.api.get_ltp_with_retry(sp, "put", expiry) or 0
+        time.sleep(1)
         bp_p = self.api.get_ltp_with_retry(bp, "put", expiry) or 0
         
-        # Log premiums
         logger.info(f"📊 Premiums: SC={sc_p}, BC={bc_p}, SP={sp_p}, BP={bp_p}")
         
         # Check if any premium is 0 (API issue)
@@ -1346,56 +1412,55 @@ class IronCondor:
             telegram.send(f"⚠️ IC Entry failed: Could not get option quotes\nTried: {sc}CE/{sp}PE\nExpiry: {expiry_display}")
             return False
         
-        credit = (sc_p - bc_p) + (sp_p - bp_p)
-        logger.info(f"📊 Net Credit: {credit:.2f} (Call spread: {sc_p - bc_p:.2f}, Put spread: {sp_p - bp_p:.2f})")
+        # === CREDIT VALIDATION ===
+        call_credit = sc_p - bc_p
+        put_credit = sp_p - bp_p
+        credit = call_credit + put_credit
         
-        if credit < MIN_PREMIUM:
-            logger.info(f"🦅 IC skipped: Credit {credit:.0f} < {MIN_PREMIUM}")
+        logger.info(f"📊 Net Credit: {credit:.2f} (Call spread: {call_credit:.2f}, Put spread: {put_credit:.2f})")
+        
+        # Check minimum credit (use IC_MIN_CREDIT which is smarter than MIN_PREMIUM)
+        min_req = max(MIN_PREMIUM, IC_MIN_CREDIT)
+        if credit < min_req:
+            logger.info(f"🦅 IC skipped: Credit {credit:.0f} < {min_req}")
             return False
         
-        logger.info(f"🦅 IC Entry: Credit={credit:.0f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
+        # Check risk:reward ratio - max loss should be < 3x credit
+        spread_width = bc - sc  # Should be same for both sides
+        max_loss_per_side = spread_width - credit
+        if max_loss_per_side > credit * 3:
+            logger.info(f"🦅 IC skipped: Poor risk:reward ({max_loss_per_side:.0f} loss vs {credit:.0f} credit = {max_loss_per_side/credit:.1f}:1)")
+            return False
         
-        # Place orders using basket order or sequential
-        order_ids = {}
-        if BASKET_ORDER:
-            legs = [
-                {"strike": sc, "option_type": "call", "side": "sell", "label": "SC"},
-                {"strike": bc, "option_type": "call", "side": "buy", "label": "BC"},
-                {"strike": sp, "option_type": "put", "side": "sell", "label": "SP"},
-                {"strike": bp, "option_type": "put", "side": "buy", "label": "BP"},
-            ]
-            basket_result = self.api.place_basket_order(legs, expiry, QUANTITY)
-            
-            if not basket_result["success"]:
-                logger.warning(f"🦅 IC Basket order failed: {basket_result['failed_legs']}")
-                if basket_result.get("rolled_back"):
-                    telegram.send(f"🦅 IC Entry failed & rolled back\nFailed: {basket_result['failed_legs']}")
-                return False
-            
-            order_ids = basket_result["order_ids"]
-            margin_info = f"\nMargin: ₹{basket_result['margin_required']:,.0f}" if basket_result.get('margin_required') else ""
-        else:
-            # Legacy sequential order placement
-            self.api.place_order(sc, "call", expiry, QUANTITY, "sell", sc_p)
-            self.api.place_order(bc, "call", expiry, QUANTITY, "buy", bc_p)
-            self.api.place_order(sp, "put", expiry, QUANTITY, "sell", sp_p)
-            self.api.place_order(bp, "put", expiry, QUANTITY, "buy", bp_p)
-            margin_info = ""
+        logger.info(f"🦅 IC Entry: Credit={credit:.0f}, MaxLoss={max_loss_per_side:.0f}, R:R=1:{credit/max_loss_per_side:.1f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
+        
+        # === PLACE ORDERS ===
+        self.api.place_order(sc, "call", expiry, QUANTITY, "sell", sc_p)
+        self.api.place_order(bc, "call", expiry, QUANTITY, "buy", bc_p)
+        self.api.place_order(sp, "put", expiry, QUANTITY, "sell", sp_p)
+        self.api.place_order(bp, "put", expiry, QUANTITY, "buy", bp_p)
         
         # Store position details
         expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
         self.position = {"sc": sc, "bc": bc, "sp": sp, "bp": bp, "expiry": expiry, "expiry_str": expiry_str}
         self.entry_premium = credit
+        self.call_credit = call_credit
+        self.put_credit = put_credit
         self.entry_prices = {"sc": sc_p, "bc": bc_p, "sp": sp_p, "bp": bp_p}
         self.entry_time = datetime.now().isoformat()
         self.spot_at_entry = spot
-        self.order_ids = order_ids
+        self.vix_at_entry = vix
+        self.peak_pnl_pct = 0
+        self.call_spread_closed = False
+        self.put_spread_closed = False
         
         # Save to file for dashboard
         self._save_position()
         
-        order_mode = "🧺 Basket" if BASKET_ORDER else "Sequential"
-        telegram.send(f"🦅 <b>Iron Condor Entry</b> ({order_mode})\nSpot: {spot}\nATM: {atm}\nSell: {sc}CE @ {sc_p:.0f} / {sp}PE @ {sp_p:.0f}\nBuy: {bc}CE @ {bc_p:.0f} / {bp}PE @ {bp_p:.0f}\nCredit: ₹{credit:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}{margin_info}")
+        vix_str = f"\nVIX: {vix:.1f}" if vix else ""
+        rr_str = f"\nR:R = 1:{credit/max_loss_per_side:.1f}"
+        mode_str = f"\nStrike Mode: {IC_STRIKE_MODE.upper()}"
+        telegram.send(f"🦅 <b>Iron Condor Entry</b>\nSpot: {spot}\nATM: {atm}\nSell: {sc}CE @ {sc_p:.0f} / {sp}PE @ {sp_p:.0f}\nBuy: {bc}CE @ {bc_p:.0f} / {bp}PE @ {bp_p:.0f}\nCredit: ₹{credit:.0f}{rr_str}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}{vix_str}{mode_str}")
         return True
     
     def _save_position(self):
@@ -1412,18 +1477,24 @@ class IronCondor:
                 },
                 "entry_prices": self.entry_prices,
                 "entry_premium": self.entry_premium,
+                "call_credit": self.call_credit,
+                "put_credit": self.put_credit,
                 "entry_time": self.entry_time,
                 "spot_at_entry": self.spot_at_entry,
+                "vix_at_entry": self.vix_at_entry,
                 "expiry": self.position.get("expiry_str", ""),
                 "quantity": QUANTITY,
-                "num_lots": NUM_LOTS
+                "num_lots": NUM_LOTS,
+                "peak_pnl_pct": self.peak_pnl_pct,
+                "call_spread_closed": self.call_spread_closed,
+                "put_spread_closed": self.put_spread_closed
             }
         else:
             pos_data["iron_condor"] = None
         save_position(pos_data)
     
     def get_live_pnl(self):
-        """Get current unrealized P&L"""
+        """Get current unrealized P&L with per-leg breakdown"""
         if not self.position:
             return None
         
@@ -1432,10 +1503,32 @@ class IronCondor:
         sp = self.api.get_ltp(self.position["sp"], "put", self.position["expiry"]) or self.entry_prices.get("sp", 0)
         bp = self.api.get_ltp(self.position["bp"], "put", self.position["expiry"]) or self.entry_prices.get("bp", 0)
         
-        current_premium = (sc - bc) + (sp - bp)
-        pnl_points = self.entry_premium - current_premium
+        # Per-spread P&L
+        current_call_spread = sc - bc
+        current_put_spread = sp - bp
+        call_spread_pnl = (self.call_credit - current_call_spread) if not self.call_spread_closed else 0
+        put_spread_pnl = (self.put_credit - current_put_spread) if not self.put_spread_closed else 0
+        
+        current_premium = 0
+        if not self.call_spread_closed:
+            current_premium += current_call_spread
+        if not self.put_spread_closed:
+            current_premium += current_put_spread
+        
+        # Use remaining entry premium for closed spreads
+        remaining_entry = 0
+        if not self.call_spread_closed:
+            remaining_entry += self.call_credit
+        if not self.put_spread_closed:
+            remaining_entry += self.put_credit
+        
+        pnl_points = remaining_entry - current_premium
         pnl_amount = pnl_points * QUANTITY
         pnl_pct = (pnl_points / self.entry_premium * 100) if self.entry_premium > 0 else 0
+        
+        # Update peak P&L for trailing stop
+        if pnl_pct > self.peak_pnl_pct:
+            self.peak_pnl_pct = pnl_pct
         
         return {
             "current_prices": {"sc": sc, "bc": bc, "sp": sp, "bp": bp},
@@ -1445,8 +1538,52 @@ class IronCondor:
             "pnl_amount": pnl_amount,
             "pnl_percent": pnl_pct,
             "target_pct": IC_TARGET_PERCENT,
-            "stoploss_pct": IC_STOP_LOSS_PERCENT
+            "stoploss_pct": IC_STOP_LOSS_PERCENT,
+            "call_spread_pnl": call_spread_pnl,
+            "put_spread_pnl": put_spread_pnl,
+            "call_spread_pnl_pct": (call_spread_pnl / self.call_credit * 100) if self.call_credit > 0 else 0,
+            "put_spread_pnl_pct": (put_spread_pnl / self.put_credit * 100) if self.put_credit > 0 else 0,
+            "peak_pnl_pct": self.peak_pnl_pct,
+            "call_spread_closed": self.call_spread_closed,
+            "put_spread_closed": self.put_spread_closed
         }
+    
+    def _adjust_threatened_spread(self, pnl_data):
+        """Close the threatened spread (losing side) and keep the winning side.
+        This locks in the loss on one side but lets the other side decay to full profit."""
+        
+        call_pnl_pct = pnl_data.get("call_spread_pnl_pct", 0)
+        put_pnl_pct = pnl_data.get("put_spread_pnl_pct", 0)
+        
+        # Check if call spread is losing badly (nifty moving up)
+        if call_pnl_pct <= -IC_ADJUSTMENT_TRIGGER_PCT and not self.call_spread_closed:
+            logger.info(f"🦅 ADJUSTING: Closing call spread (losing {call_pnl_pct:.0f}%)")
+            
+            # Close call spread: buy back sold call, sell bought call
+            self.api.place_order(self.position["sc"], "call", self.position["expiry"], QUANTITY, "buy", 0)
+            self.api.place_order(self.position["bc"], "call", self.position["expiry"], QUANTITY, "sell", 0)
+            
+            self.call_spread_closed = True
+            self._save_position()
+            
+            telegram.send(f"🦅 <b>IC Adjustment</b>\nClosed CALL spread (loss: {call_pnl_pct:.0f}%)\nKeeping PUT spread for theta decay")
+            return True
+        
+        # Check if put spread is losing badly (nifty moving down)
+        if put_pnl_pct <= -IC_ADJUSTMENT_TRIGGER_PCT and not self.put_spread_closed:
+            logger.info(f"🦅 ADJUSTING: Closing put spread (losing {put_pnl_pct:.0f}%)")
+            
+            # Close put spread: buy back sold put, sell bought put
+            self.api.place_order(self.position["sp"], "put", self.position["expiry"], QUANTITY, "buy", 0)
+            self.api.place_order(self.position["bp"], "put", self.position["expiry"], QUANTITY, "sell", 0)
+            
+            self.put_spread_closed = True
+            self._save_position()
+            
+            telegram.send(f"🦅 <b>IC Adjustment</b>\nClosed PUT spread (loss: {put_pnl_pct:.0f}%)\nKeeping CALL spread for theta decay")
+            return True
+        
+        return False
     
     def check_exit(self):
         if not self.position:
@@ -1458,46 +1595,77 @@ class IronCondor:
         
         pnl_pct = pnl_data["pnl_percent"]
         
+        # === TARGET HIT ===
         if pnl_pct >= IC_TARGET_PERCENT:
             return "TARGET"
+        
+        # === TRAILING STOP LOSS ===
+        if IC_TRAILING_SL and self.peak_pnl_pct >= IC_TRAILING_ACTIVATE_PCT:
+            trailing_sl_level = self.peak_pnl_pct - IC_TRAILING_OFFSET_PCT
+            if pnl_pct <= trailing_sl_level:
+                logger.info(f"🦅 Trailing SL hit: Peak={self.peak_pnl_pct:.1f}%, Current={pnl_pct:.1f}%, Trail level={trailing_sl_level:.1f}%")
+                return "TRAILING_SL"
+        
+        # === PER-LEG STOP LOSS (close threatened spread, keep winning side) ===
+        if IC_ADJUSTMENT_ENABLED and not (self.call_spread_closed or self.put_spread_closed):
+            adjusted = self._adjust_threatened_spread(pnl_data)
+            if adjusted:
+                return None  # Don't exit fully, just adjusted
+        
+        # === PER-LEG SL (after adjustment already done, if remaining side also losing) ===
+        if IC_LEG_SL_ENABLED:
+            call_loss_pct = pnl_data.get("call_spread_pnl_pct", 0)
+            put_loss_pct = pnl_data.get("put_spread_pnl_pct", 0)
+            
+            # If both spreads are losing beyond individual SL
+            if not self.call_spread_closed and call_loss_pct <= -IC_LEG_SL_PERCENT:
+                return "LEG_STOP_LOSS"
+            if not self.put_spread_closed and put_loss_pct <= -IC_LEG_SL_PERCENT:
+                return "LEG_STOP_LOSS"
+        
+        # === OVERALL STOP LOSS ===
         if pnl_pct <= -IC_STOP_LOSS_PERCENT:
             return "STOP_LOSS"
         
+        # === TIME EXIT ===
         now = get_ist_now()
         current_time = now.strftime("%H:%M")
         if current_time >= EXIT_TIME:
             return "TIME_EXIT"
+        
         return None
     
     def exit(self, reason):
         if not self.position:
             return 0
         
+        # Get current prices for P&L calculation
         sc = self.api.get_ltp(self.position["sc"], "call", self.position["expiry"]) or 0
         bc = self.api.get_ltp(self.position["bc"], "call", self.position["expiry"]) or 0
         sp = self.api.get_ltp(self.position["sp"], "put", self.position["expiry"]) or 0
         bp = self.api.get_ltp(self.position["bp"], "put", self.position["expiry"]) or 0
         
-        # Place exit orders using basket or sequential
-        if BASKET_ORDER:
-            exit_legs = [
-                {"strike": self.position["sc"], "option_type": "call", "side": "buy", "label": "SC_exit"},
-                {"strike": self.position["bc"], "option_type": "call", "side": "sell", "label": "BC_exit"},
-                {"strike": self.position["sp"], "option_type": "put", "side": "buy", "label": "SP_exit"},
-                {"strike": self.position["bp"], "option_type": "put", "side": "sell", "label": "BP_exit"},
-            ]
-            basket_result = self.api.place_basket_order(exit_legs, self.position["expiry"], QUANTITY)
-            if not basket_result["success"]:
-                logger.error(f"🦅 IC Exit basket partially failed: {basket_result['failed_legs']}")
-                # Continue anyway to record the trade
-        else:
+        # Only place orders for spreads that are still open
+        if not self.call_spread_closed:
             self.api.place_order(self.position["sc"], "call", self.position["expiry"], QUANTITY, "buy", sc)
             self.api.place_order(self.position["bc"], "call", self.position["expiry"], QUANTITY, "sell", bc)
+        
+        if not self.put_spread_closed:
             self.api.place_order(self.position["sp"], "put", self.position["expiry"], QUANTITY, "buy", sp)
             self.api.place_order(self.position["bp"], "put", self.position["expiry"], QUANTITY, "sell", bp)
         
-        exit_prem = (sc - bc) + (sp - bp)
+        exit_prem = 0
+        if not self.call_spread_closed:
+            exit_prem += (sc - bc)
+        if not self.put_spread_closed:
+            exit_prem += (sp - bp)
+        
         pnl = (self.entry_premium - exit_prem) * QUANTITY - CHARGES_PER_LOT
+        
+        # Track SL for re-entry prevention
+        if reason in ["STOP_LOSS", "LEG_STOP_LOSS", "TRAILING_SL"]:
+            self.sl_hit_today = True
+            self.sl_hit_date = get_ist_now().strftime("%Y-%m-%d")
         
         add_trade({
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -1505,16 +1673,31 @@ class IronCondor:
             "entry_premium": self.entry_premium,
             "exit_premium": exit_prem,
             "pnl": pnl,
-            "exit_reason": reason
+            "exit_reason": reason,
+            "vix_at_entry": self.vix_at_entry,
+            "peak_pnl_pct": self.peak_pnl_pct,
+            "call_credit": self.call_credit,
+            "put_credit": self.put_credit,
+            "call_spread_closed": self.call_spread_closed,
+            "put_spread_closed": self.put_spread_closed
         })
         
-        telegram.send(f"🦅 <b>IC Exit</b>\n{reason}\nP&L: ₹{pnl:+,.0f}")
-        logger.info(f"🦅 IC Exit: {reason}, P&L: {pnl}")
+        exit_emoji = {"TARGET": "🎯", "TRAILING_SL": "📉", "STOP_LOSS": "🛑", "LEG_STOP_LOSS": "🦿", "TIME_EXIT": "⏰"}.get(reason, "🦅")
+        adjusted_str = ""
+        if self.call_spread_closed:
+            adjusted_str = "\n(Call spread was closed earlier)"
+        elif self.put_spread_closed:
+            adjusted_str = "\n(Put spread was closed earlier)"
+        
+        telegram.send(f"🦅 <b>IC Exit</b> {exit_emoji}\n{reason}\nP&L: ₹{pnl:+,.0f}\nPeak P&L: {self.peak_pnl_pct:.1f}%{adjusted_str}")
+        logger.info(f"🦅 IC Exit: {reason}, P&L: {pnl}, Peak: {self.peak_pnl_pct:.1f}%")
         
         self.position = None
         self.entry_prices = {}
-        self.order_ids = {}
-        self._save_position()  # Clear position from file
+        self.call_spread_closed = False
+        self.put_spread_closed = False
+        self.peak_pnl_pct = 0
+        self._save_position()
         return pnl
 
 # ============================================
@@ -1528,7 +1711,6 @@ class ShortStraddle:
         self.entry_prices = {}
         self.entry_time = None
         self.spot_at_entry = None
-        self.order_ids = {}
         
     def enter(self, spot, expiry):
         atm = round(spot / 50) * 50
@@ -1537,9 +1719,10 @@ class ShortStraddle:
         expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
         logger.info(f"📊 Straddle Setup: ATM={atm}, Expiry={expiry_display}")
         
-        # Get LTPs with rate limiting
+        # Get LTPs with delays to avoid rate limits
         logger.info(f"📊 Fetching premiums (with rate limiting)...")
         ce = self.api.get_ltp_with_retry(atm, "call", expiry) or 0
+        time.sleep(1)  # Delay between calls
         pe = self.api.get_ltp_with_retry(atm, "put", expiry) or 0
         
         logger.info(f"📊 Premiums: CE={ce}, PE={pe}")
@@ -1558,27 +1741,8 @@ class ShortStraddle:
         
         logger.info(f"📊 Straddle Entry: {atm}, Premium={total:.0f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
         
-        # Place orders using basket or sequential
-        order_ids = {}
-        if BASKET_ORDER:
-            legs = [
-                {"strike": atm, "option_type": "call", "side": "sell", "label": "CE"},
-                {"strike": atm, "option_type": "put", "side": "sell", "label": "PE"},
-            ]
-            basket_result = self.api.place_basket_order(legs, expiry, QUANTITY)
-            
-            if not basket_result["success"]:
-                logger.warning(f"📊 Straddle Basket order failed: {basket_result['failed_legs']}")
-                if basket_result.get("rolled_back"):
-                    telegram.send(f"📊 Straddle Entry failed & rolled back\nFailed: {basket_result['failed_legs']}")
-                return False
-            
-            order_ids = basket_result["order_ids"]
-            margin_info = f"\nMargin: ₹{basket_result['margin_required']:,.0f}" if basket_result.get('margin_required') else ""
-        else:
-            self.api.place_order(atm, "call", expiry, QUANTITY, "sell", ce)
-            self.api.place_order(atm, "put", expiry, QUANTITY, "sell", pe)
-            margin_info = ""
+        self.api.place_order(atm, "call", expiry, QUANTITY, "sell", ce)
+        self.api.place_order(atm, "put", expiry, QUANTITY, "sell", pe)
         
         # Store position details
         expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
@@ -1587,13 +1751,11 @@ class ShortStraddle:
         self.entry_prices = {"ce": ce, "pe": pe}
         self.entry_time = datetime.now().isoformat()
         self.spot_at_entry = spot
-        self.order_ids = order_ids
         
         # Save to file for dashboard
         self._save_position()
         
-        order_mode = "🧺 Basket" if BASKET_ORDER else "Sequential"
-        telegram.send(f"📊 <b>Straddle Entry</b> ({order_mode})\nSpot: {spot}\nStrike: {atm}\nCE: ₹{ce:.0f} / PE: ₹{pe:.0f}\nTotal Premium: ₹{total:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}{margin_info}")
+        telegram.send(f"📊 <b>Straddle Entry</b>\nSpot: {spot}\nStrike: {atm}\nCE: ₹{ce:.0f} / PE: ₹{pe:.0f}\nTotal Premium: ₹{total:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
         return True
     
     def _save_position(self):
@@ -1667,18 +1829,8 @@ class ShortStraddle:
         ce = self.api.get_ltp(self.position["strike"], "call", self.position["expiry"]) or 0
         pe = self.api.get_ltp(self.position["strike"], "put", self.position["expiry"]) or 0
         
-        # Place exit orders using basket or sequential
-        if BASKET_ORDER:
-            exit_legs = [
-                {"strike": self.position["strike"], "option_type": "call", "side": "buy", "label": "CE_exit"},
-                {"strike": self.position["strike"], "option_type": "put", "side": "buy", "label": "PE_exit"},
-            ]
-            basket_result = self.api.place_basket_order(exit_legs, self.position["expiry"], QUANTITY)
-            if not basket_result["success"]:
-                logger.error(f"📊 Straddle Exit basket partially failed: {basket_result['failed_legs']}")
-        else:
-            self.api.place_order(self.position["strike"], "call", self.position["expiry"], QUANTITY, "buy", ce)
-            self.api.place_order(self.position["strike"], "put", self.position["expiry"], QUANTITY, "buy", pe)
+        self.api.place_order(self.position["strike"], "call", self.position["expiry"], QUANTITY, "buy", ce)
+        self.api.place_order(self.position["strike"], "put", self.position["expiry"], QUANTITY, "buy", pe)
         
         exit_prem = ce + pe
         pnl = (self.entry_premium - exit_prem) * QUANTITY - CHARGES_PER_LOT
@@ -1697,7 +1849,6 @@ class ShortStraddle:
         
         self.position = None
         self.entry_prices = {}
-        self.order_ids = {}
         self._save_position()  # Clear position from file
         return pnl
 
@@ -1744,8 +1895,15 @@ def bot_thread():
     logger.info(f"📊 Strategy: {STRATEGY}")
     logger.info(f"💰 Lot Size: {LOT_SIZE}, Num Lots: {NUM_LOTS}, Total Qty: {QUANTITY}")
     logger.info(f"💵 Min Premium: {MIN_PREMIUM}")
-    logger.info(f"🧺 Basket Orders: {'ENABLED' if BASKET_ORDER else 'DISABLED'} (Rollback: {'ON' if BASKET_ROLLBACK else 'OFF'})")
     logger.info(f"🚀 Auto-start: {AUTO_START}")
+    
+    # Log IC improvement settings
+    logger.info(f"🦅 IC Improvements v2.0:")
+    logger.info(f"   VIX Filter: {IC_VIX_MIN}-{IC_VIX_MAX} | Strike Mode: {IC_STRIKE_MODE}")
+    logger.info(f"   Min Credit: {IC_MIN_CREDIT} | Trailing SL: {IC_TRAILING_SL} ({IC_TRAILING_ACTIVATE_PCT}%/{IC_TRAILING_OFFSET_PCT}%)")
+    logger.info(f"   Adjustment: {IC_ADJUSTMENT_ENABLED} (trigger: {IC_ADJUSTMENT_TRIGGER_PCT}%) | Leg SL: {IC_LEG_SL_ENABLED} ({IC_LEG_SL_PERCENT}%)")
+    logger.info(f"   Expiry Day Avoid: {IC_AVOID_EXPIRY_DAY} | Spot Buffer: {IC_SPOT_BUFFER}")
+    logger.info(f"   Re-entry after SL: {IC_REENTRY_AFTER_SL} | Daily Loss Limit: {'₹'+str(IC_DAILY_LOSS_LIMIT) if IC_DAILY_LOSS_LIMIT > 0 else 'OFF'}")
     
     # Log expiry info
     if CUSTOM_EXPIRY:
@@ -1769,6 +1927,62 @@ def bot_thread():
     # Set global references for live P&L API
     _live_ic = ic
     _live_straddle = straddle
+    
+    # === POSITION RECOVERY ON RESTART ===
+    # If there was an active position stored from before a restart, recover it
+    try:
+        pos_data = load_position()
+        if pos_data.get("iron_condor") and pos_data["iron_condor"]:
+            stored_ic = pos_data["iron_condor"]
+            strikes = stored_ic.get("strikes", {})
+            if strikes.get("sell_call"):
+                # Restore IC position state
+                expiry_str = stored_ic.get("expiry", "")
+                try:
+                    expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d") if expiry_str else get_next_expiry()
+                except:
+                    expiry_dt = get_next_expiry()
+                
+                ic.position = {
+                    "sc": strikes["sell_call"], "bc": strikes["buy_call"],
+                    "sp": strikes["sell_put"], "bp": strikes["buy_put"],
+                    "expiry": expiry_dt, "expiry_str": expiry_str
+                }
+                ic.entry_premium = stored_ic.get("entry_premium", 0)
+                ic.call_credit = stored_ic.get("call_credit", ic.entry_premium / 2)
+                ic.put_credit = stored_ic.get("put_credit", ic.entry_premium / 2)
+                ic.entry_prices = stored_ic.get("entry_prices", {})
+                ic.entry_time = stored_ic.get("entry_time", "")
+                ic.spot_at_entry = stored_ic.get("spot_at_entry", 0)
+                ic.vix_at_entry = stored_ic.get("vix_at_entry")
+                ic.peak_pnl_pct = stored_ic.get("peak_pnl_pct", 0)
+                ic.call_spread_closed = stored_ic.get("call_spread_closed", False)
+                ic.put_spread_closed = stored_ic.get("put_spread_closed", False)
+                
+                logger.info(f"🔄 Recovered IC position: SC={strikes['sell_call']}, SP={strikes['sell_put']}, Credit={ic.entry_premium}")
+                telegram.send(f"🔄 Recovered IC position after restart\nSC={strikes['sell_call']}CE / SP={strikes['sell_put']}PE\nCredit: ₹{ic.entry_premium:.0f}")
+        
+        if pos_data.get("straddle") and pos_data["straddle"]:
+            stored_str = pos_data["straddle"]
+            if stored_str.get("strike"):
+                expiry_str = stored_str.get("expiry", "")
+                try:
+                    expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d") if expiry_str else get_next_expiry()
+                except:
+                    expiry_dt = get_next_expiry()
+                
+                straddle.position = {
+                    "strike": stored_str["strike"],
+                    "expiry": expiry_dt, "expiry_str": expiry_str
+                }
+                straddle.entry_premium = stored_str.get("entry_premium", 0)
+                straddle.entry_prices = stored_str.get("entry_prices", {})
+                straddle.entry_time = stored_str.get("entry_time", "")
+                straddle.spot_at_entry = stored_str.get("spot_at_entry", 0)
+                
+                logger.info(f"🔄 Recovered Straddle position: Strike={stored_str['strike']}, Premium={straddle.entry_premium}")
+    except Exception as e:
+        logger.error(f"Position recovery error: {e}")
     
     last_connect = datetime.now() - timedelta(hours=1)
     last_status_log = datetime.now() - timedelta(minutes=5)
@@ -1861,8 +2075,17 @@ def bot_thread():
                 if spot:
                     logger.info(f"🎯 Entry window active. Spot: {spot}, Expiry: {expiry}")
                     
+                    # Check daily loss limit before entering any new trades
+                    daily_loss_exceeded = False
+                    if IC_DAILY_LOSS_LIMIT > 0:
+                        data = load_data()
+                        daily_pnl = data.get("daily_pnl", 0)
+                        if daily_pnl < -IC_DAILY_LOSS_LIMIT:
+                            daily_loss_exceeded = True
+                            logger.info(f"🛑 Daily loss limit hit: ₹{daily_pnl:,.0f} < -₹{IC_DAILY_LOSS_LIMIT:,.0f}")
+                    
                     # Enter Iron Condor if no position
-                    if strategy in ["iron_condor", "both"] and not ic.position:
+                    if strategy in ["iron_condor", "both"] and not ic.position and not daily_loss_exceeded:
                         logger.info("🦅 Attempting Iron Condor entry...")
                         if ic.enter(spot, expiry):
                             logger.info("✅ Iron Condor position opened")
@@ -1870,7 +2093,7 @@ def bot_thread():
                             logger.info("⚠️ Iron Condor entry skipped (low premium or API issue)")
                     
                     # Enter Straddle if no position
-                    if strategy in ["straddle", "both"] and not straddle.position:
+                    if strategy in ["straddle", "both"] and not straddle.position and not daily_loss_exceeded:
                         logger.info("📊 Attempting Straddle entry...")
                         if straddle.enter(spot, expiry):
                             logger.info("✅ Straddle position opened")
@@ -2221,7 +2444,7 @@ DASHBOARD_HTML = """
                     <!-- Iron Condor Position -->
                     <div id="ic-position" class="position-card" style="display: none;">
                         <div class="position-header">
-                            <span class="position-strategy">🦅 IRON CONDOR</span>
+                            <span class="position-strategy">🦅 IRON CONDOR <span id="ic-version-badge" style="font-size:0.65rem;background:#333;padding:2px 6px;border-radius:8px;margin-left:5px;">v2.0</span></span>
                             <span class="position-pnl" id="ic-pnl">₹0</span>
                         </div>
                         <div class="position-details">
@@ -2241,6 +2464,14 @@ DASHBOARD_HTML = """
                                 <span>Quantity:</span>
                                 <span id="ic-qty">--</span>
                             </div>
+                            <div class="position-row">
+                                <span>VIX at Entry:</span>
+                                <span id="ic-vix-entry">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>Strike Mode:</span>
+                                <span id="ic-strike-mode">--</span>
+                            </div>
                         </div>
                         <table class="position-table">
                             <thead>
@@ -2249,6 +2480,19 @@ DASHBOARD_HTML = """
                             <tbody id="ic-legs">
                             </tbody>
                         </table>
+                        <!-- Per-Spread P&L -->
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:15px;">
+                            <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:10px;text-align:center;">
+                                <div style="font-size:0.7rem;color:#888;margin-bottom:4px;">📞 CALL SPREAD</div>
+                                <div id="ic-call-spread-pnl" style="font-size:1rem;font-weight:600;">--</div>
+                                <div id="ic-call-spread-status" style="font-size:0.65rem;color:#888;margin-top:2px;"></div>
+                            </div>
+                            <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:10px;text-align:center;">
+                                <div style="font-size:0.7rem;color:#888;margin-bottom:4px;">📱 PUT SPREAD</div>
+                                <div id="ic-put-spread-pnl" style="font-size:1rem;font-weight:600;">--</div>
+                                <div id="ic-put-spread-status" style="font-size:0.65rem;color:#888;margin-top:2px;"></div>
+                            </div>
+                        </div>
                         <div class="position-summary">
                             <div class="summary-item">
                                 <span>Entry Credit:</span>
@@ -2266,6 +2510,14 @@ DASHBOARD_HTML = """
                                 <span>P&L %:</span>
                                 <span id="ic-pnl-pct">0%</span>
                             </div>
+                            <div class="summary-item">
+                                <span>Peak P&L %:</span>
+                                <span id="ic-peak-pnl" style="color:#00d2ff;">--</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Trail SL Level:</span>
+                                <span id="ic-trailing-sl-level" style="color:#ffa726;">--</span>
+                            </div>
                         </div>
                         <div class="position-progress">
                             <div class="progress-bar">
@@ -2280,6 +2532,10 @@ DASHBOARD_HTML = """
                                 <span id="ic-sl-label">-100%</span>
                                 <span id="ic-target-label">+50%</span>
                             </div>
+                        </div>
+                        <!-- Adjustment Alert -->
+                        <div id="ic-adjustment-alert" style="display:none;margin-top:10px;padding:10px;border-radius:8px;background:rgba(255,167,38,0.15);border:1px solid rgba(255,167,38,0.3);font-size:0.85rem;color:#ffa726;">
+                            ⚙️ <span id="ic-adjustment-text"></span>
                         </div>
                     </div>
                     
@@ -2708,10 +2964,24 @@ DASHBOARD_HTML = """
                 document.getElementById('ic-spot-entry').textContent = ic.spot_at_entry ? ic.spot_at_entry.toFixed(2) : '--';
                 document.getElementById('ic-expiry').textContent = ic.expiry || '--';
                 document.getElementById('ic-qty').textContent = ic.quantity + ' (' + ic.num_lots + ' lots)';
+                document.getElementById('ic-vix-entry').textContent = ic.vix_at_entry ? ic.vix_at_entry.toFixed(1) : 'N/A';
+                document.getElementById('ic-strike-mode').textContent = (ic.strike_mode || 'fixed').toUpperCase();
                 
                 // Calculate P&L from entry prices (static display)
                 const entryCredit = ic.entry_premium || 0;
                 document.getElementById('ic-entry-credit').textContent = '₹' + entryCredit.toFixed(2);
+                
+                // Show adjustment status
+                const adjAlert = document.getElementById('ic-adjustment-alert');
+                if (ic.call_spread_closed) {
+                    adjAlert.style.display = 'block';
+                    document.getElementById('ic-adjustment-text').textContent = 'Call spread closed (adjustment). Put spread still active.';
+                } else if (ic.put_spread_closed) {
+                    adjAlert.style.display = 'block';
+                    document.getElementById('ic-adjustment-text').textContent = 'Put spread closed (adjustment). Call spread still active.';
+                } else {
+                    adjAlert.style.display = 'none';
+                }
                 
                 // Legs table
                 const strikes = ic.strikes || {};
@@ -2818,6 +3088,46 @@ DASHBOARD_HTML = """
                     
                     // Update P&L %
                     document.getElementById('ic-pnl-pct').textContent = (pnl >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%';
+                    
+                    // Update per-spread P&L
+                    const callPnlPct = ic.call_spread_pnl_pct || 0;
+                    const putPnlPct = ic.put_spread_pnl_pct || 0;
+                    const callSpreadEl = document.getElementById('ic-call-spread-pnl');
+                    const putSpreadEl = document.getElementById('ic-put-spread-pnl');
+                    
+                    if (ic.call_spread_closed) {
+                        callSpreadEl.textContent = 'CLOSED';
+                        callSpreadEl.style.color = '#888';
+                        document.getElementById('ic-call-spread-status').textContent = '(adjusted)';
+                    } else {
+                        callSpreadEl.textContent = (callPnlPct >= 0 ? '+' : '') + callPnlPct.toFixed(1) + '%';
+                        callSpreadEl.style.color = callPnlPct >= 0 ? '#00c853' : '#ff5252';
+                        document.getElementById('ic-call-spread-status').textContent = '';
+                    }
+                    
+                    if (ic.put_spread_closed) {
+                        putSpreadEl.textContent = 'CLOSED';
+                        putSpreadEl.style.color = '#888';
+                        document.getElementById('ic-put-spread-status').textContent = '(adjusted)';
+                    } else {
+                        putSpreadEl.textContent = (putPnlPct >= 0 ? '+' : '') + putPnlPct.toFixed(1) + '%';
+                        putSpreadEl.style.color = putPnlPct >= 0 ? '#00c853' : '#ff5252';
+                        document.getElementById('ic-put-spread-status').textContent = '';
+                    }
+                    
+                    // Update peak P&L and trailing SL level
+                    const peakPnl = ic.peak_pnl_pct || 0;
+                    document.getElementById('ic-peak-pnl').textContent = '+' + peakPnl.toFixed(1) + '%';
+                    
+                    const trailActivate = ic.target_pct ? Math.min(ic.target_pct, 30) : 30;
+                    if (peakPnl >= trailActivate) {
+                        const trailLevel = peakPnl - 15; // IC_TRAILING_OFFSET_PCT default
+                        document.getElementById('ic-trailing-sl-level').textContent = '+' + trailLevel.toFixed(1) + '% ✓';
+                        document.getElementById('ic-trailing-sl-level').style.color = '#ffa726';
+                    } else {
+                        document.getElementById('ic-trailing-sl-level').textContent = 'Not active';
+                        document.getElementById('ic-trailing-sl-level').style.color = '#666';
+                    }
                     
                     // Update current prices in table
                     if (ic.current_prices) {
@@ -3301,9 +3611,18 @@ def api_status():
         "api_secret_set": bool(API_SECRET),
         "session_set": bool(API_SESSION),
         "telegram_enabled": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
-        "basket_order": BASKET_ORDER,
-        "basket_rollback": BASKET_ROLLBACK,
-        "basket_retry": BASKET_RETRY
+        "ic_improvements": {
+            "vix_filter": {"enabled": True, "min": IC_VIX_MIN, "max": IC_VIX_MAX},
+            "strike_mode": IC_STRIKE_MODE,
+            "min_credit": IC_MIN_CREDIT,
+            "trailing_sl": {"enabled": IC_TRAILING_SL, "activate_pct": IC_TRAILING_ACTIVATE_PCT, "offset_pct": IC_TRAILING_OFFSET_PCT},
+            "adjustment": {"enabled": IC_ADJUSTMENT_ENABLED, "trigger_pct": IC_ADJUSTMENT_TRIGGER_PCT},
+            "leg_sl": {"enabled": IC_LEG_SL_ENABLED, "percent": IC_LEG_SL_PERCENT},
+            "spot_buffer": IC_SPOT_BUFFER,
+            "avoid_expiry_day": IC_AVOID_EXPIRY_DAY,
+            "reentry_after_sl": IC_REENTRY_AFTER_SL,
+            "daily_loss_limit": IC_DAILY_LOSS_LIMIT
+        }
     })
 
 @app.route('/api/settings', methods=['GET', 'POST'])
@@ -3327,9 +3646,21 @@ def api_settings():
             "ic_stop_loss_percent": IC_STOP_LOSS_PERCENT,
             "str_target_percent": STR_TARGET_PERCENT,
             "str_stop_loss_percent": STR_STOP_LOSS_PERCENT,
-            "basket_order": BASKET_ORDER,
-            "basket_rollback": BASKET_ROLLBACK,
-            "basket_retry": BASKET_RETRY
+            "ic_vix_max": IC_VIX_MAX,
+            "ic_vix_min": IC_VIX_MIN,
+            "ic_strike_mode": IC_STRIKE_MODE,
+            "ic_min_credit": IC_MIN_CREDIT,
+            "ic_trailing_sl": IC_TRAILING_SL,
+            "ic_trailing_activate_pct": IC_TRAILING_ACTIVATE_PCT,
+            "ic_trailing_offset_pct": IC_TRAILING_OFFSET_PCT,
+            "ic_adjustment_enabled": IC_ADJUSTMENT_ENABLED,
+            "ic_adjustment_trigger_pct": IC_ADJUSTMENT_TRIGGER_PCT,
+            "ic_leg_sl_enabled": IC_LEG_SL_ENABLED,
+            "ic_leg_sl_percent": IC_LEG_SL_PERCENT,
+            "ic_spot_buffer": IC_SPOT_BUFFER,
+            "ic_avoid_expiry_day": IC_AVOID_EXPIRY_DAY,
+            "ic_reentry_after_sl": IC_REENTRY_AFTER_SL,
+            "ic_daily_loss_limit": IC_DAILY_LOSS_LIMIT
         })
     return jsonify({"status": "settings are read-only, configure via environment variables"})
 

@@ -4,7 +4,7 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 
 ## ✨ Features
 
-- 🦅 **Iron Condor** - Limited risk, 65-70% win rate
+- 🦅 **Iron Condor v2.0** - VIX filter, dynamic strikes, trailing SL, per-leg adjustments
 - 📊 **Short Straddle** - Higher premium, 55-60% win rate
 - 🖥️ **Web Dashboard** - Real-time P&L tracking
 - 📱 **Telegram Alerts** - Trade notifications & remote control
@@ -100,6 +100,42 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | `IC_STOP_LOSS_PERCENT` | IC: Stop loss % | 100 |
 | `STR_TARGET_PERCENT` | Straddle: Target profit % | 30 |
 | `STR_STOP_LOSS_PERCENT` | Straddle: Stop loss % | 20 |
+
+#### Optional - Iron Condor v2.0 Improvements
+
+These settings control the advanced IC strategy features. All are optional with sensible defaults.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| **VIX Filter** | | |
+| `IC_VIX_MAX` | Skip entry if India VIX > this (too volatile for IC) | 16 |
+| `IC_VIX_MIN` | Skip entry if India VIX < this (premiums too cheap) | 9 |
+| **Strike Selection** | | |
+| `IC_STRIKE_MODE` | `fixed` (distance-based) or `dynamic` (OI-based) | fixed |
+| `IC_MIN_CREDIT` | Minimum net credit required to enter | 20 |
+| `IC_SPOT_BUFFER` | Widen strikes when spot is near day's high/low | true |
+| **Risk Management** | | |
+| `IC_TRAILING_SL` | Enable trailing stop loss | true |
+| `IC_TRAILING_ACTIVATE_PCT` | Activate trailing SL after this % profit | 30 |
+| `IC_TRAILING_OFFSET_PCT` | Trail behind peak by this % | 15 |
+| `IC_LEG_SL_ENABLED` | Per-leg stop loss on individual spreads | true |
+| `IC_LEG_SL_PERCENT` | Exit a spread when it loses this % of its credit | 150 |
+| `IC_DAILY_LOSS_LIMIT` | Stop trading if daily realized loss exceeds this (0=off) | 0 |
+| **Adjustments** | | |
+| `IC_ADJUSTMENT_ENABLED` | Close losing spread, keep winning side (partial exit) | true |
+| `IC_ADJUSTMENT_TRIGGER_PCT` | Trigger adjustment when one spread loses this % | 70 |
+| **Safety** | | |
+| `IC_AVOID_EXPIRY_DAY` | Don't open new IC on expiry day (gamma risk) | true |
+| `IC_REENTRY_AFTER_SL` | Allow re-entry on same day after SL hit | false |
+
+> **How IC v2.0 works:**
+> 1. **VIX Filter** — Only enters when India VIX is 9-16 (the sweet spot for premium selling)
+> 2. **Dynamic Strikes** — When `IC_STRIKE_MODE=dynamic`, picks sell strikes at highest Open Interest levels (natural support/resistance) instead of fixed distances
+> 3. **Spot Buffer** — If Nifty is near the day's high, call strikes widen by 50pts; near day's low, put strikes widen
+> 4. **Risk:Reward Check** — Rejects trades where max loss > 3× credit received
+> 5. **Trailing Stop** — After 30% profit, trail 15% behind peak (e.g., peak +40% → exits at +25%)
+> 6. **Adjustment** — If one spread loses 70% of credit, close that spread and keep the winning side for theta decay
+> 7. **Position Recovery** — If the bot restarts mid-trade, it recovers the active position from disk and continues managing it
 
 > **Note:** `API_SESSION` expires daily. You can update it via Telegram `/session TOKEN` or the dashboard.
 
