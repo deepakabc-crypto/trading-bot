@@ -69,6 +69,11 @@ MIN_PREMIUM = int(os.environ.get("MIN_PREMIUM", "10"))  # Lowered to 10
 CHARGES_PER_LOT = int(os.environ.get("CHARGES_PER_LOT", "100"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # Increased to 60 seconds to avoid rate limits
 
+# Basket order settings
+BASKET_ORDER = os.environ.get("BASKET_ORDER", "true").lower() == "true"  # Use basket order (concurrent multi-leg placement)
+BASKET_RETRY = int(os.environ.get("BASKET_RETRY", "2"))  # Retries per leg in basket
+BASKET_ROLLBACK = os.environ.get("BASKET_ROLLBACK", "true").lower() == "true"  # Auto-rollback failed basket orders
+
 # Auto-start trading
 AUTO_START = os.environ.get("AUTO_START", "true").lower() == "true"
 
@@ -631,6 +636,7 @@ class BreezeAPI:
             if isinstance(expiry, datetime):
                 expiry = format_expiry_for_breeze(expiry)
                 
+            self._rate_limit()
             order = self.breeze.place_order(
                 stock_code="NIFTY", exchange_code="NFO", product="options",
                 action=side.lower(), order_type="market", quantity=str(quantity),
@@ -639,11 +645,186 @@ class BreezeAPI:
                 stoploss="", disclosed_quantity=""
             )
             if order and 'Success' in order:
-                logger.info(f"Order: {side} {strike} {option_type}")
-                return order['Success']['order_id']
+                order_id = order['Success'].get('order_id', 'unknown')
+                logger.info(f"✅ Order placed: {side} {quantity}x {strike}{option_type.upper()} → {order_id}")
+                return order_id
+            elif order and order.get('Error'):
+                logger.error(f"❌ Order rejected: {side} {strike}{option_type.upper()} → {order.get('Error')}")
         except Exception as e:
             logger.error(f"Order error: {e}")
         return None
+    
+    def place_basket_order(self, legs: list, expiry, quantity: int) -> dict:
+        """
+        Place multiple option legs as a basket order (concurrent execution).
+        
+        Breeze API does not have a native basket_order endpoint, so this method:
+        1. Pre-validates all legs with margin_calculator (if available)
+        2. Places all legs in rapid succession with minimal delay
+        3. Tracks order IDs for each leg
+        4. Rolls back (reverses) successful legs if any critical leg fails
+        
+        Args:
+            legs: List of dicts with keys: strike, option_type, side
+                  e.g. [{"strike": 23000, "option_type": "call", "side": "sell", "label": "SC"}, ...]
+            expiry: Expiry datetime or string
+            quantity: Quantity per leg
+        
+        Returns:
+            dict with keys: success (bool), order_ids (dict), failed_legs (list),
+                           margin_required (float), rolled_back (bool)
+        """
+        result = {
+            "success": False,
+            "order_ids": {},
+            "failed_legs": [],
+            "margin_required": None,
+            "rolled_back": False,
+            "total_legs": len(legs),
+            "placed_legs": 0
+        }
+        
+        if not self.connected or not legs:
+            logger.error("🧺 Basket order failed: API not connected or empty legs")
+            return result
+        
+        # Format expiry once
+        expiry_str = format_expiry_for_breeze(expiry) if isinstance(expiry, datetime) else expiry
+        expiry_alt = format_expiry_breeze_alt(expiry) if isinstance(expiry, datetime) else expiry
+        
+        # Step 1: Pre-check margin using margin_calculator
+        margin_required = self._check_basket_margin(legs, expiry_alt, quantity)
+        result["margin_required"] = margin_required
+        if margin_required:
+            logger.info(f"🧺 Basket margin required: ₹{margin_required:,.0f}")
+        
+        # Step 2: Place all legs rapidly
+        logger.info(f"🧺 Placing basket order: {len(legs)} legs, Qty={quantity}")
+        
+        successful_orders = {}  # label -> order_id
+        failed_orders = []      # labels of failed legs
+        
+        for leg in legs:
+            strike = leg["strike"]
+            opt_type = leg["option_type"]
+            side = leg["side"]
+            label = leg.get("label", f"{strike}{opt_type[0].upper()}")
+            
+            # Try placing with retry
+            order_id = None
+            for attempt in range(BASKET_RETRY):
+                order_id = self.place_order(strike, opt_type, expiry_str, quantity, side, 0)
+                if order_id:
+                    break
+                if attempt < BASKET_RETRY - 1:
+                    logger.warning(f"🧺 Retry {attempt + 1} for {label}")
+                    time.sleep(1)
+            
+            if order_id:
+                successful_orders[label] = order_id
+                result["placed_legs"] += 1
+                logger.info(f"🧺 ✅ {label}: {side.upper()} {strike}{opt_type.upper()} → {order_id}")
+            else:
+                failed_orders.append(label)
+                logger.error(f"🧺 ❌ {label}: {side.upper()} {strike}{opt_type.upper()} FAILED")
+        
+        result["order_ids"] = successful_orders
+        result["failed_legs"] = failed_orders
+        
+        # Step 3: Evaluate success and rollback if needed
+        if not failed_orders:
+            # All legs placed successfully
+            result["success"] = True
+            logger.info(f"🧺 ✅ Basket order complete: {len(successful_orders)}/{len(legs)} legs placed")
+            telegram.send(f"🧺 <b>Basket Order Placed</b>\n{len(successful_orders)} legs executed successfully")
+        else:
+            # Some legs failed
+            logger.error(f"🧺 ⚠️ Basket order partial: {len(successful_orders)}/{len(legs)} legs placed, "
+                        f"{len(failed_orders)} failed: {failed_orders}")
+            
+            # Rollback if enabled and if we have some successful orders
+            if BASKET_ROLLBACK and successful_orders:
+                logger.warning(f"🧺 🔄 Rolling back {len(successful_orders)} successful legs...")
+                self._rollback_basket(successful_orders, legs, expiry_str, quantity)
+                result["rolled_back"] = True
+                result["success"] = False
+                telegram.send(f"🧺 ❌ <b>Basket Order Failed & Rolled Back</b>\n"
+                            f"Failed legs: {', '.join(failed_orders)}\n"
+                            f"Rolled back: {', '.join(successful_orders.keys())}")
+            else:
+                # Partial fill - keep what we got
+                result["success"] = len(successful_orders) > 0
+                telegram.send(f"🧺 ⚠️ <b>Basket Order Partial</b>\n"
+                            f"Placed: {len(successful_orders)}/{len(legs)} legs\n"
+                            f"Failed: {', '.join(failed_orders)}")
+        
+        return result
+    
+    def _check_basket_margin(self, legs: list, expiry: str, quantity: int) -> float:
+        """Check combined margin requirement for a basket of option legs using margin_calculator"""
+        if not self.connected:
+            return None
+        try:
+            positions = []
+            for leg in legs:
+                positions.append({
+                    "strike_price": str(leg["strike"]),
+                    "quantity": str(quantity),
+                    "right": leg["option_type"].capitalize(),
+                    "product": "options",
+                    "action": leg["side"].capitalize(),
+                    "price": "0",
+                    "expiry_date": expiry,
+                    "stock_code": "NIFTY",
+                    "cover_order_flow": "N",
+                    "fresh_order_type": "N",
+                    "cover_limit_rate": "0",
+                    "cover_sltp_price": "0",
+                    "fresh_limit_rate": "0",
+                    "open_quantity": "0"
+                })
+            
+            self._rate_limit()
+            result = self.breeze.margin_calculator(positions)
+            
+            if result and result.get('Success'):
+                span = float(result['Success'].get('span_margin_required', 0))
+                non_span = float(result['Success'].get('non_span_margin_required', 0))
+                total_margin = span + non_span
+                logger.info(f"🧺 Margin: SPAN=₹{span:,.0f}, Non-SPAN=₹{non_span:,.0f}, Total=₹{total_margin:,.0f}")
+                return total_margin
+            elif result and result.get('Error'):
+                logger.warning(f"🧺 Margin check error: {result.get('Error')}")
+        except Exception as e:
+            logger.warning(f"🧺 Margin calculator not available: {e}")
+        return None
+    
+    def _rollback_basket(self, successful_orders: dict, original_legs: list, expiry: str, quantity: int):
+        """Rollback successful basket orders by placing reverse orders"""
+        # Build reverse mapping: label -> original leg
+        leg_map = {}
+        for leg in original_legs:
+            label = leg.get("label", f"{leg['strike']}{leg['option_type'][0].upper()}")
+            leg_map[label] = leg
+        
+        for label, order_id in successful_orders.items():
+            leg = leg_map.get(label)
+            if not leg:
+                continue
+            
+            # Reverse the side
+            reverse_side = "buy" if leg["side"].lower() == "sell" else "sell"
+            
+            logger.info(f"🧺 🔄 Reversing {label}: {reverse_side.upper()} {leg['strike']}{leg['option_type'].upper()}")
+            reverse_id = self.place_order(leg["strike"], leg["option_type"], expiry, quantity, reverse_side, 0)
+            
+            if reverse_id:
+                logger.info(f"🧺 ✅ Rollback {label} successful → {reverse_id}")
+            else:
+                logger.error(f"🧺 ❌ Rollback {label} FAILED - MANUAL INTERVENTION NEEDED!")
+                telegram.send(f"🚨 ALERT: Rollback failed for {label}! Manual square-off needed.")
+            
+            time.sleep(0.5)  # Small delay between rollback orders
     
     def get_expiry(self):
         """Get next expiry date for live trading"""
@@ -1136,6 +1317,7 @@ class IronCondor:
         self.entry_prices = {}
         self.entry_time = None
         self.spot_at_entry = None
+        self.order_ids = {}
         
     def enter(self, spot, expiry):
         atm = round(spot / 50) * 50
@@ -1151,14 +1333,8 @@ class IronCondor:
         logger.info(f"📊 Fetching premiums (with rate limiting)...")
         
         sc_p = self.api.get_ltp_with_retry(sc, "call", expiry) or 0
-        time.sleep(1)  # Delay between calls
-        
         bc_p = self.api.get_ltp_with_retry(bc, "call", expiry) or 0
-        time.sleep(1)
-        
         sp_p = self.api.get_ltp_with_retry(sp, "put", expiry) or 0
-        time.sleep(1)
-        
         bp_p = self.api.get_ltp_with_retry(bp, "put", expiry) or 0
         
         # Log premiums
@@ -1179,11 +1355,32 @@ class IronCondor:
         
         logger.info(f"🦅 IC Entry: Credit={credit:.0f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
         
-        # Place orders
-        self.api.place_order(sc, "call", expiry, QUANTITY, "sell", sc_p)
-        self.api.place_order(bc, "call", expiry, QUANTITY, "buy", bc_p)
-        self.api.place_order(sp, "put", expiry, QUANTITY, "sell", sp_p)
-        self.api.place_order(bp, "put", expiry, QUANTITY, "buy", bp_p)
+        # Place orders using basket order or sequential
+        order_ids = {}
+        if BASKET_ORDER:
+            legs = [
+                {"strike": sc, "option_type": "call", "side": "sell", "label": "SC"},
+                {"strike": bc, "option_type": "call", "side": "buy", "label": "BC"},
+                {"strike": sp, "option_type": "put", "side": "sell", "label": "SP"},
+                {"strike": bp, "option_type": "put", "side": "buy", "label": "BP"},
+            ]
+            basket_result = self.api.place_basket_order(legs, expiry, QUANTITY)
+            
+            if not basket_result["success"]:
+                logger.warning(f"🦅 IC Basket order failed: {basket_result['failed_legs']}")
+                if basket_result.get("rolled_back"):
+                    telegram.send(f"🦅 IC Entry failed & rolled back\nFailed: {basket_result['failed_legs']}")
+                return False
+            
+            order_ids = basket_result["order_ids"]
+            margin_info = f"\nMargin: ₹{basket_result['margin_required']:,.0f}" if basket_result.get('margin_required') else ""
+        else:
+            # Legacy sequential order placement
+            self.api.place_order(sc, "call", expiry, QUANTITY, "sell", sc_p)
+            self.api.place_order(bc, "call", expiry, QUANTITY, "buy", bc_p)
+            self.api.place_order(sp, "put", expiry, QUANTITY, "sell", sp_p)
+            self.api.place_order(bp, "put", expiry, QUANTITY, "buy", bp_p)
+            margin_info = ""
         
         # Store position details
         expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
@@ -1192,11 +1389,13 @@ class IronCondor:
         self.entry_prices = {"sc": sc_p, "bc": bc_p, "sp": sp_p, "bp": bp_p}
         self.entry_time = datetime.now().isoformat()
         self.spot_at_entry = spot
+        self.order_ids = order_ids
         
         # Save to file for dashboard
         self._save_position()
         
-        telegram.send(f"🦅 <b>Iron Condor Entry</b>\nSpot: {spot}\nATM: {atm}\nSell: {sc}CE @ {sc_p:.0f} / {sp}PE @ {sp_p:.0f}\nBuy: {bc}CE @ {bc_p:.0f} / {bp}PE @ {bp_p:.0f}\nCredit: ₹{credit:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
+        order_mode = "🧺 Basket" if BASKET_ORDER else "Sequential"
+        telegram.send(f"🦅 <b>Iron Condor Entry</b> ({order_mode})\nSpot: {spot}\nATM: {atm}\nSell: {sc}CE @ {sc_p:.0f} / {sp}PE @ {sp_p:.0f}\nBuy: {bc}CE @ {bc_p:.0f} / {bp}PE @ {bp_p:.0f}\nCredit: ₹{credit:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}{margin_info}")
         return True
     
     def _save_position(self):
@@ -1279,10 +1478,23 @@ class IronCondor:
         sp = self.api.get_ltp(self.position["sp"], "put", self.position["expiry"]) or 0
         bp = self.api.get_ltp(self.position["bp"], "put", self.position["expiry"]) or 0
         
-        self.api.place_order(self.position["sc"], "call", self.position["expiry"], QUANTITY, "buy", sc)
-        self.api.place_order(self.position["bc"], "call", self.position["expiry"], QUANTITY, "sell", bc)
-        self.api.place_order(self.position["sp"], "put", self.position["expiry"], QUANTITY, "buy", sp)
-        self.api.place_order(self.position["bp"], "put", self.position["expiry"], QUANTITY, "sell", bp)
+        # Place exit orders using basket or sequential
+        if BASKET_ORDER:
+            exit_legs = [
+                {"strike": self.position["sc"], "option_type": "call", "side": "buy", "label": "SC_exit"},
+                {"strike": self.position["bc"], "option_type": "call", "side": "sell", "label": "BC_exit"},
+                {"strike": self.position["sp"], "option_type": "put", "side": "buy", "label": "SP_exit"},
+                {"strike": self.position["bp"], "option_type": "put", "side": "sell", "label": "BP_exit"},
+            ]
+            basket_result = self.api.place_basket_order(exit_legs, self.position["expiry"], QUANTITY)
+            if not basket_result["success"]:
+                logger.error(f"🦅 IC Exit basket partially failed: {basket_result['failed_legs']}")
+                # Continue anyway to record the trade
+        else:
+            self.api.place_order(self.position["sc"], "call", self.position["expiry"], QUANTITY, "buy", sc)
+            self.api.place_order(self.position["bc"], "call", self.position["expiry"], QUANTITY, "sell", bc)
+            self.api.place_order(self.position["sp"], "put", self.position["expiry"], QUANTITY, "buy", sp)
+            self.api.place_order(self.position["bp"], "put", self.position["expiry"], QUANTITY, "sell", bp)
         
         exit_prem = (sc - bc) + (sp - bp)
         pnl = (self.entry_premium - exit_prem) * QUANTITY - CHARGES_PER_LOT
@@ -1301,6 +1513,7 @@ class IronCondor:
         
         self.position = None
         self.entry_prices = {}
+        self.order_ids = {}
         self._save_position()  # Clear position from file
         return pnl
 
@@ -1315,6 +1528,7 @@ class ShortStraddle:
         self.entry_prices = {}
         self.entry_time = None
         self.spot_at_entry = None
+        self.order_ids = {}
         
     def enter(self, spot, expiry):
         atm = round(spot / 50) * 50
@@ -1323,10 +1537,9 @@ class ShortStraddle:
         expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
         logger.info(f"📊 Straddle Setup: ATM={atm}, Expiry={expiry_display}")
         
-        # Get LTPs with delays to avoid rate limits
+        # Get LTPs with rate limiting
         logger.info(f"📊 Fetching premiums (with rate limiting)...")
         ce = self.api.get_ltp_with_retry(atm, "call", expiry) or 0
-        time.sleep(1)  # Delay between calls
         pe = self.api.get_ltp_with_retry(atm, "put", expiry) or 0
         
         logger.info(f"📊 Premiums: CE={ce}, PE={pe}")
@@ -1345,8 +1558,27 @@ class ShortStraddle:
         
         logger.info(f"📊 Straddle Entry: {atm}, Premium={total:.0f}, Qty={QUANTITY} ({NUM_LOTS} lots)")
         
-        self.api.place_order(atm, "call", expiry, QUANTITY, "sell", ce)
-        self.api.place_order(atm, "put", expiry, QUANTITY, "sell", pe)
+        # Place orders using basket or sequential
+        order_ids = {}
+        if BASKET_ORDER:
+            legs = [
+                {"strike": atm, "option_type": "call", "side": "sell", "label": "CE"},
+                {"strike": atm, "option_type": "put", "side": "sell", "label": "PE"},
+            ]
+            basket_result = self.api.place_basket_order(legs, expiry, QUANTITY)
+            
+            if not basket_result["success"]:
+                logger.warning(f"📊 Straddle Basket order failed: {basket_result['failed_legs']}")
+                if basket_result.get("rolled_back"):
+                    telegram.send(f"📊 Straddle Entry failed & rolled back\nFailed: {basket_result['failed_legs']}")
+                return False
+            
+            order_ids = basket_result["order_ids"]
+            margin_info = f"\nMargin: ₹{basket_result['margin_required']:,.0f}" if basket_result.get('margin_required') else ""
+        else:
+            self.api.place_order(atm, "call", expiry, QUANTITY, "sell", ce)
+            self.api.place_order(atm, "put", expiry, QUANTITY, "sell", pe)
+            margin_info = ""
         
         # Store position details
         expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
@@ -1355,11 +1587,13 @@ class ShortStraddle:
         self.entry_prices = {"ce": ce, "pe": pe}
         self.entry_time = datetime.now().isoformat()
         self.spot_at_entry = spot
+        self.order_ids = order_ids
         
         # Save to file for dashboard
         self._save_position()
         
-        telegram.send(f"📊 <b>Straddle Entry</b>\nSpot: {spot}\nStrike: {atm}\nCE: ₹{ce:.0f} / PE: ₹{pe:.0f}\nTotal Premium: ₹{total:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}")
+        order_mode = "🧺 Basket" if BASKET_ORDER else "Sequential"
+        telegram.send(f"📊 <b>Straddle Entry</b> ({order_mode})\nSpot: {spot}\nStrike: {atm}\nCE: ₹{ce:.0f} / PE: ₹{pe:.0f}\nTotal Premium: ₹{total:.0f}\nQty: {QUANTITY} ({NUM_LOTS} lots)\nExpiry: {expiry_display}{margin_info}")
         return True
     
     def _save_position(self):
@@ -1433,8 +1667,18 @@ class ShortStraddle:
         ce = self.api.get_ltp(self.position["strike"], "call", self.position["expiry"]) or 0
         pe = self.api.get_ltp(self.position["strike"], "put", self.position["expiry"]) or 0
         
-        self.api.place_order(self.position["strike"], "call", self.position["expiry"], QUANTITY, "buy", ce)
-        self.api.place_order(self.position["strike"], "put", self.position["expiry"], QUANTITY, "buy", pe)
+        # Place exit orders using basket or sequential
+        if BASKET_ORDER:
+            exit_legs = [
+                {"strike": self.position["strike"], "option_type": "call", "side": "buy", "label": "CE_exit"},
+                {"strike": self.position["strike"], "option_type": "put", "side": "buy", "label": "PE_exit"},
+            ]
+            basket_result = self.api.place_basket_order(exit_legs, self.position["expiry"], QUANTITY)
+            if not basket_result["success"]:
+                logger.error(f"📊 Straddle Exit basket partially failed: {basket_result['failed_legs']}")
+        else:
+            self.api.place_order(self.position["strike"], "call", self.position["expiry"], QUANTITY, "buy", ce)
+            self.api.place_order(self.position["strike"], "put", self.position["expiry"], QUANTITY, "buy", pe)
         
         exit_prem = ce + pe
         pnl = (self.entry_premium - exit_prem) * QUANTITY - CHARGES_PER_LOT
@@ -1453,6 +1697,7 @@ class ShortStraddle:
         
         self.position = None
         self.entry_prices = {}
+        self.order_ids = {}
         self._save_position()  # Clear position from file
         return pnl
 
@@ -1499,6 +1744,7 @@ def bot_thread():
     logger.info(f"📊 Strategy: {STRATEGY}")
     logger.info(f"💰 Lot Size: {LOT_SIZE}, Num Lots: {NUM_LOTS}, Total Qty: {QUANTITY}")
     logger.info(f"💵 Min Premium: {MIN_PREMIUM}")
+    logger.info(f"🧺 Basket Orders: {'ENABLED' if BASKET_ORDER else 'DISABLED'} (Rollback: {'ON' if BASKET_ROLLBACK else 'OFF'})")
     logger.info(f"🚀 Auto-start: {AUTO_START}")
     
     # Log expiry info
@@ -3054,7 +3300,10 @@ def api_status():
         "api_key_set": bool(API_KEY),
         "api_secret_set": bool(API_SECRET),
         "session_set": bool(API_SESSION),
-        "telegram_enabled": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+        "telegram_enabled": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "basket_order": BASKET_ORDER,
+        "basket_rollback": BASKET_ROLLBACK,
+        "basket_retry": BASKET_RETRY
     })
 
 @app.route('/api/settings', methods=['GET', 'POST'])
@@ -3077,7 +3326,10 @@ def api_settings():
             "ic_target_percent": IC_TARGET_PERCENT,
             "ic_stop_loss_percent": IC_STOP_LOSS_PERCENT,
             "str_target_percent": STR_TARGET_PERCENT,
-            "str_stop_loss_percent": STR_STOP_LOSS_PERCENT
+            "str_stop_loss_percent": STR_STOP_LOSS_PERCENT,
+            "basket_order": BASKET_ORDER,
+            "basket_rollback": BASKET_ROLLBACK,
+            "basket_retry": BASKET_RETRY
         })
     return jsonify({"status": "settings are read-only, configure via environment variables"})
 

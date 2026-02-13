@@ -9,6 +9,7 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 - 🖥️ **Web Dashboard** - Real-time P&L tracking
 - 📱 **Telegram Alerts** - Trade notifications & remote control
 - 🔬 **Backtesting Engine** - Test strategies on historical data
+- 🧺 **Basket Orders** - Multi-leg order placement with margin check & auto-rollback
 - 📜 **Trade History** - Persistent trade logs
 - ☁️ **Railway Ready** - One-click deploy
 
@@ -60,6 +61,16 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | `AUTO_START` | Auto-start bot on deploy | true |
 
 > **Note:** Total quantity = LOT_SIZE × NUM_LOTS (e.g., 75 × 2 = 150)
+
+#### Optional - Basket Order Settings
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BASKET_ORDER` | Enable basket order (multi-leg) mode | true |
+| `BASKET_RETRY` | Retries per leg if order fails | 2 |
+| `BASKET_ROLLBACK` | Auto-rollback if any leg fails | true |
+
+> **Basket Orders:** The Breeze API does not have a native basket order endpoint. The bot implements a software-level basket order that places all legs rapidly, pre-checks margin using `margin_calculator()`, and auto-rolls back successful legs if any critical leg fails. Set `BASKET_ORDER=false` to use legacy sequential order placement.
 
 #### Optional - Timing (IST)
 
