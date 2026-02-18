@@ -60,6 +60,22 @@ IC_STOP_LOSS_PERCENT = int(os.environ.get("IC_STOP_LOSS_PERCENT", "100"))
 STR_TARGET_PERCENT = int(os.environ.get("STR_TARGET_PERCENT", "30"))
 STR_STOP_LOSS_PERCENT = int(os.environ.get("STR_STOP_LOSS_PERCENT", "20"))
 
+# === DAILY SCALP SETTINGS ===
+# Intraday ATM straddle sell with strict time-based exit — no overnight risk
+SCALP_NUM_LOTS = int(os.environ.get("SCALP_NUM_LOTS", "3"))        # 3 lots by default (195 qty)
+SCALP_QUANTITY = LOT_SIZE * SCALP_NUM_LOTS
+SCALP_TARGET_PERCENT = int(os.environ.get("SCALP_TARGET_PERCENT", "25"))   # 25% premium decay target
+SCALP_STOP_LOSS_PERCENT = int(os.environ.get("SCALP_STOP_LOSS_PERCENT", "40"))  # 40% premium rise = SL
+SCALP_ENTRY_TIME = os.environ.get("SCALP_ENTRY_TIME", "09:45")     # Enter after opening range
+SCALP_EXIT_TIME = os.environ.get("SCALP_EXIT_TIME", "14:00")       # Hard exit by 2 PM — NO overnight
+SCALP_SPOT_SL_POINTS = int(os.environ.get("SCALP_SPOT_SL_POINTS", "150"))  # Exit if Nifty moves ±150 pts
+SCALP_TRAIL_ENABLED = os.environ.get("SCALP_TRAIL_ENABLED", "true").lower() == "true"
+SCALP_TRAIL_ACTIVATE_PCT = int(os.environ.get("SCALP_TRAIL_ACTIVATE_PCT", "15"))   # Activate trail after 15% profit
+SCALP_TRAIL_OFFSET_PCT = int(os.environ.get("SCALP_TRAIL_OFFSET_PCT", "10"))      # Trail 10% behind peak
+SCALP_MIN_PREMIUM = int(os.environ.get("SCALP_MIN_PREMIUM", "100"))  # Min combined premium to enter
+SCALP_MAX_VIX = float(os.environ.get("SCALP_MAX_VIX", "20"))       # Don't scalp if VIX > 20 (too wild)
+SCALP_MIN_VIX = float(os.environ.get("SCALP_MIN_VIX", "10"))       # Don't scalp if VIX < 10 (no premium)
+
 # === IMPROVED IC SETTINGS ===
 # VIX-based entry filter (skip trades when volatility is too high)
 IC_VIX_MAX = float(os.environ.get("IC_VIX_MAX", "16"))           # Don't enter IC if India VIX > this
@@ -173,6 +189,7 @@ def load_position():
     return {
         "iron_condor": None,
         "straddle": None,
+        "daily_scalp": None,
         "last_update": ""
     }
 
@@ -1120,6 +1137,49 @@ class Backtester:
                     trades.append(trade)
                     capital += pnl
                 
+                if strategy in ["daily_scalp", "both"]:
+                    # Scalp uses same ATM straddle simulation but with scalp-specific params
+                    trade = self.simulate_straddle(spot, expiry, trade_date)
+                    trade["strategy"] = "DAILY_SCALP"
+                    
+                    if trade.get("data_source") == "API":
+                        api_data_count += 1
+                    else:
+                        estimated_data_count += 1
+                    
+                    # Scalp has its own entry/exit times
+                    scalp_entry_mins = int(SCALP_ENTRY_TIME.split(':')[0]) * 60 + int(SCALP_ENTRY_TIME.split(':')[1])
+                    scalp_entry_mins += random.randint(0, 15)  # Small random offset
+                    scalp_entry_time = f"{scalp_entry_mins // 60:02d}:{scalp_entry_mins % 60:02d}"
+                    
+                    exit_result = self.simulate_intraday_exit(
+                        trade["total_premium"],
+                        SCALP_TARGET_PERCENT,
+                        SCALP_STOP_LOSS_PERCENT,
+                        scalp_entry_time,
+                        SCALP_EXIT_TIME
+                    )
+                    
+                    if exit_result["exit_reason"] == "TARGET":
+                        pnl = trade["total_premium"] * SCALP_QUANTITY * (SCALP_TARGET_PERCENT / 100) - CHARGES_PER_LOT
+                    elif exit_result["exit_reason"] == "STOP_LOSS":
+                        pnl = -trade["total_premium"] * SCALP_QUANTITY * (SCALP_STOP_LOSS_PERCENT / 100) - CHARGES_PER_LOT
+                    else:  # TIME_EXIT
+                        # Scalp time exits tend to be smaller (shorter window)
+                        time_exit_pct = (random.random() - 0.35) * 40
+                        pnl = trade["total_premium"] * SCALP_QUANTITY * (time_exit_pct / 100) - CHARGES_PER_LOT
+                    
+                    trade["pnl"] = round(pnl, 2)
+                    trade["exit_reason"] = exit_result["exit_reason"]
+                    trade["entry_date"] = trade_date.strftime("%Y-%m-%d")
+                    trade["entry_time"] = scalp_entry_time
+                    trade["exit_time"] = exit_result["exit_time"]
+                    trade["target_pct"] = SCALP_TARGET_PERCENT
+                    trade["sl_pct"] = SCALP_STOP_LOSS_PERCENT
+                    trade["quantity"] = SCALP_QUANTITY
+                    trades.append(trade)
+                    capital += pnl
+                
                 # Update spot with small random walk
                 spot = spot * (1 + (random.random() - 0.5) * 0.01)
         
@@ -1853,8 +1913,282 @@ class ShortStraddle:
         return pnl
 
 # ============================================
-# BOT RUNNER (Background Thread)
+# DAILY SCALP STRATEGY (Intraday Straddle Sell)
 # ============================================
+class DailyScalp:
+    """
+    Daily Scalp Strategy — Intraday ATM Straddle Sell
+    
+    Rules:
+    - SELL ATM CE + SELL ATM PE at 9:45 AM (after opening range)
+    - Target: 25% premium decay
+    - SL: Combined premium rises 40% OR Nifty moves ±150 pts
+    - Hard exit: 2:00 PM — NEVER hold overnight
+    - Trailing SL: After 15% profit, trail 10% behind peak
+    - Repeat Mon-Thu (skip expiry Friday if needed)
+    
+    Risk Management:
+    - Naked selling = fat premium but unlimited risk
+    - Strict SL + time exit = risk capped to ~₹15-25K per day
+    - VIX filter: Only trade when VIX 10-20
+    """
+    
+    def __init__(self, api):
+        self.api = api
+        self.position = None
+        self.entry_premium = 0
+        self.entry_prices = {}
+        self.entry_time = None
+        self.spot_at_entry = None
+        self.peak_pnl_pct = 0
+        self.sl_hit_today = False
+        self.sl_hit_date = None
+        self.vix_at_entry = None
+    
+    def _check_vix(self) -> tuple:
+        """Check VIX is in acceptable range for scalp"""
+        vix = self.api.get_vix()
+        if vix is None:
+            logger.info("⚡ Scalp: VIX unavailable - proceeding without filter")
+            return True, None, "VIX unavailable"
+        
+        if vix > SCALP_MAX_VIX:
+            return False, vix, f"VIX {vix:.1f} > {SCALP_MAX_VIX} (too volatile for naked sell)"
+        if vix < SCALP_MIN_VIX:
+            return False, vix, f"VIX {vix:.1f} < {SCALP_MIN_VIX} (premiums too cheap)"
+        
+        return True, vix, f"VIX {vix:.1f} OK"
+    
+    def enter(self, spot, expiry):
+        """Enter daily scalp — SELL ATM CE + PE"""
+        
+        # Check if SL was already hit today (no re-entry)
+        if self.sl_hit_today:
+            now = get_ist_now()
+            if self.sl_hit_date and now.strftime("%Y-%m-%d") == self.sl_hit_date:
+                logger.info("⚡ Scalp skipped: SL already hit today, no re-entry")
+                return False
+            else:
+                self.sl_hit_today = False
+        
+        # VIX check
+        vix_ok, vix, vix_reason = self._check_vix()
+        if not vix_ok:
+            logger.info(f"⚡ Scalp skipped: {vix_reason}")
+            telegram.send(f"⚡ Scalp Entry skipped\n{vix_reason}")
+            return False
+        
+        atm = round(spot / 50) * 50
+        expiry_display = expiry.strftime('%d-%b-%Y') if isinstance(expiry, datetime) else expiry
+        
+        logger.info(f"⚡ Scalp Setup: ATM={atm}, Spot={spot}, Expiry={expiry_display}")
+        
+        # Fetch premiums
+        logger.info(f"⚡ Fetching ATM premiums...")
+        ce = self.api.get_ltp_with_retry(atm, "call", expiry) or 0
+        time.sleep(1)
+        pe = self.api.get_ltp_with_retry(atm, "put", expiry) or 0
+        
+        logger.info(f"⚡ Premiums: CE={ce}, PE={pe}")
+        
+        if ce == 0 or pe == 0:
+            logger.warning(f"⚠️ Could not get scalp premiums (CE={ce}, PE={pe})")
+            telegram.send(f"⚠️ Scalp Entry failed: Could not get option quotes\n{atm}CE/{atm}PE\nExpiry: {expiry_display}")
+            return False
+        
+        total = ce + pe
+        
+        if total < SCALP_MIN_PREMIUM:
+            logger.info(f"⚡ Scalp skipped: Premium {total:.0f} < {SCALP_MIN_PREMIUM}")
+            return False
+        
+        logger.info(f"⚡ Scalp Entry: {atm}, Premium={total:.0f}, Qty={SCALP_QUANTITY} ({SCALP_NUM_LOTS} lots)")
+        
+        # Place orders — SELL CE + SELL PE (naked straddle)
+        self.api.place_order(atm, "call", expiry, SCALP_QUANTITY, "sell", ce)
+        self.api.place_order(atm, "put", expiry, SCALP_QUANTITY, "sell", pe)
+        
+        # Store position
+        expiry_str = expiry.strftime('%Y-%m-%d') if isinstance(expiry, datetime) else expiry
+        self.position = {"strike": atm, "expiry": expiry, "expiry_str": expiry_str}
+        self.entry_premium = total
+        self.entry_prices = {"ce": ce, "pe": pe}
+        self.entry_time = datetime.now().isoformat()
+        self.spot_at_entry = spot
+        self.peak_pnl_pct = 0
+        self.vix_at_entry = vix
+        
+        self._save_position()
+        
+        vix_str = f"\nVIX: {vix:.1f}" if vix else ""
+        target_amt = total * SCALP_QUANTITY * SCALP_TARGET_PERCENT / 100
+        sl_amt = total * SCALP_QUANTITY * SCALP_STOP_LOSS_PERCENT / 100
+        telegram.send(
+            f"⚡ <b>Daily Scalp Entry</b>\n"
+            f"Spot: {spot}\n"
+            f"Strike: {atm}\n"
+            f"CE: ₹{ce:.0f} / PE: ₹{pe:.0f}\n"
+            f"Total Premium: ₹{total:.0f}\n"
+            f"Qty: {SCALP_QUANTITY} ({SCALP_NUM_LOTS} lots)\n"
+            f"Target: ₹{target_amt:,.0f} ({SCALP_TARGET_PERCENT}%)\n"
+            f"SL: ₹{sl_amt:,.0f} ({SCALP_STOP_LOSS_PERCENT}%) or ±{SCALP_SPOT_SL_POINTS}pts\n"
+            f"Hard Exit: {SCALP_EXIT_TIME}\n"
+            f"Expiry: {expiry_display}{vix_str}"
+        )
+        return True
+    
+    def _save_position(self):
+        """Save position to file for dashboard"""
+        pos_data = load_position()
+        if self.position:
+            pos_data["daily_scalp"] = {
+                "strategy": "DAILY_SCALP",
+                "strike": self.position["strike"],
+                "entry_prices": self.entry_prices,
+                "entry_premium": self.entry_premium,
+                "entry_time": self.entry_time,
+                "spot_at_entry": self.spot_at_entry,
+                "vix_at_entry": self.vix_at_entry,
+                "expiry": self.position.get("expiry_str", ""),
+                "quantity": SCALP_QUANTITY,
+                "num_lots": SCALP_NUM_LOTS,
+                "peak_pnl_pct": self.peak_pnl_pct
+            }
+        else:
+            pos_data["daily_scalp"] = None
+        save_position(pos_data)
+    
+    def get_live_pnl(self):
+        """Get current unrealized P&L"""
+        if not self.position:
+            return None
+        
+        ce = self.api.get_ltp(self.position["strike"], "call", self.position["expiry"]) or self.entry_prices.get("ce", 0)
+        pe = self.api.get_ltp(self.position["strike"], "put", self.position["expiry"]) or self.entry_prices.get("pe", 0)
+        
+        current_premium = ce + pe
+        pnl_points = self.entry_premium - current_premium
+        pnl_amount = pnl_points * SCALP_QUANTITY
+        pnl_pct = (pnl_points / self.entry_premium * 100) if self.entry_premium > 0 else 0
+        
+        # Update peak P&L for trailing stop
+        if pnl_pct > self.peak_pnl_pct:
+            self.peak_pnl_pct = pnl_pct
+            self._save_position()  # Persist peak
+        
+        # Get current spot for spot-based SL
+        current_spot = self.api.get_spot() or self.spot_at_entry
+        spot_move = abs(current_spot - self.spot_at_entry) if self.spot_at_entry else 0
+        
+        return {
+            "current_prices": {"ce": ce, "pe": pe},
+            "current_premium": current_premium,
+            "entry_premium": self.entry_premium,
+            "pnl_points": pnl_points,
+            "pnl_amount": pnl_amount,
+            "pnl_percent": pnl_pct,
+            "target_pct": SCALP_TARGET_PERCENT,
+            "stoploss_pct": SCALP_STOP_LOSS_PERCENT,
+            "peak_pnl_pct": self.peak_pnl_pct,
+            "spot_at_entry": self.spot_at_entry,
+            "current_spot": current_spot,
+            "spot_move": spot_move,
+            "spot_sl_points": SCALP_SPOT_SL_POINTS
+        }
+    
+    def check_exit(self):
+        """Check all exit conditions for daily scalp"""
+        if not self.position:
+            return None
+        
+        pnl_data = self.get_live_pnl()
+        if not pnl_data:
+            return None
+        
+        pnl_pct = pnl_data["pnl_percent"]
+        spot_move = pnl_data["spot_move"]
+        
+        # === TARGET HIT ===
+        if pnl_pct >= SCALP_TARGET_PERCENT:
+            return "TARGET"
+        
+        # === TRAILING STOP LOSS ===
+        if SCALP_TRAIL_ENABLED and self.peak_pnl_pct >= SCALP_TRAIL_ACTIVATE_PCT:
+            trailing_sl_level = self.peak_pnl_pct - SCALP_TRAIL_OFFSET_PCT
+            if pnl_pct <= trailing_sl_level:
+                logger.info(f"⚡ Scalp Trailing SL: Peak={self.peak_pnl_pct:.1f}%, Current={pnl_pct:.1f}%, Trail={trailing_sl_level:.1f}%")
+                return "TRAILING_SL"
+        
+        # === PREMIUM STOP LOSS (combined premium rises) ===
+        if pnl_pct <= -SCALP_STOP_LOSS_PERCENT:
+            return "STOP_LOSS"
+        
+        # === SPOT-BASED STOP LOSS ===
+        if spot_move >= SCALP_SPOT_SL_POINTS:
+            logger.info(f"⚡ Scalp Spot SL: Move={spot_move:.0f}pts >= {SCALP_SPOT_SL_POINTS}pts")
+            return "SPOT_SL"
+        
+        # === HARD TIME EXIT — NEVER hold overnight ===
+        now = get_ist_now()
+        current_time = now.strftime("%H:%M")
+        if current_time >= SCALP_EXIT_TIME:
+            return "TIME_EXIT"
+        
+        return None
+    
+    def exit(self, reason):
+        """Exit daily scalp — buy back CE + PE"""
+        if not self.position:
+            return 0
+        
+        ce = self.api.get_ltp(self.position["strike"], "call", self.position["expiry"]) or 0
+        pe = self.api.get_ltp(self.position["strike"], "put", self.position["expiry"]) or 0
+        
+        # Buy back to close
+        self.api.place_order(self.position["strike"], "call", self.position["expiry"], SCALP_QUANTITY, "buy", ce)
+        self.api.place_order(self.position["strike"], "put", self.position["expiry"], SCALP_QUANTITY, "buy", pe)
+        
+        exit_prem = ce + pe
+        pnl = (self.entry_premium - exit_prem) * SCALP_QUANTITY - CHARGES_PER_LOT
+        
+        # Track SL for re-entry prevention
+        if reason in ["STOP_LOSS", "SPOT_SL", "TRAILING_SL"]:
+            self.sl_hit_today = True
+            self.sl_hit_date = get_ist_now().strftime("%Y-%m-%d")
+        
+        add_trade({
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "strategy": "DAILY_SCALP",
+            "entry_premium": self.entry_premium,
+            "exit_premium": exit_prem,
+            "pnl": pnl,
+            "exit_reason": reason,
+            "vix_at_entry": self.vix_at_entry,
+            "peak_pnl_pct": self.peak_pnl_pct,
+            "spot_at_entry": self.spot_at_entry,
+            "quantity": SCALP_QUANTITY,
+            "num_lots": SCALP_NUM_LOTS
+        })
+        
+        exit_emoji = {
+            "TARGET": "🎯", "TRAILING_SL": "📉", "STOP_LOSS": "🛑", 
+            "SPOT_SL": "📍", "TIME_EXIT": "⏰"
+        }.get(reason, "⚡")
+        
+        telegram.send(
+            f"⚡ <b>Scalp Exit</b> {exit_emoji}\n"
+            f"{reason}\n"
+            f"P&L: ₹{pnl:+,.0f}\n"
+            f"Peak P&L: {self.peak_pnl_pct:.1f}%\n"
+            f"Entry: ₹{self.entry_premium:.0f} → Exit: ₹{exit_prem:.0f}"
+        )
+        logger.info(f"⚡ Scalp Exit: {reason}, P&L: {pnl:+,.0f}, Peak: {self.peak_pnl_pct:.1f}%")
+        
+        self.position = None
+        self.entry_prices = {}
+        self.peak_pnl_pct = 0
+        self._save_position()
+        return pnl
 def is_trading_time():
     """Check if current time is within entry window (IST)"""
     now = get_ist_now()
@@ -1887,7 +2221,7 @@ def is_market_hours():
     return "09:15" <= current_time <= "15:30"
 
 def bot_thread():
-    global _live_ic, _live_straddle
+    global _live_ic, _live_straddle, _live_scalp
     
     logger.info("🤖 Bot thread starting...")
     logger.info(f"⏰ Entry Time: {ENTRY_TIME_START} - {ENTRY_TIME_END} IST")
@@ -1904,6 +2238,13 @@ def bot_thread():
     logger.info(f"   Adjustment: {IC_ADJUSTMENT_ENABLED} (trigger: {IC_ADJUSTMENT_TRIGGER_PCT}%) | Leg SL: {IC_LEG_SL_ENABLED} ({IC_LEG_SL_PERCENT}%)")
     logger.info(f"   Expiry Day Avoid: {IC_AVOID_EXPIRY_DAY} | Spot Buffer: {IC_SPOT_BUFFER}")
     logger.info(f"   Re-entry after SL: {IC_REENTRY_AFTER_SL} | Daily Loss Limit: {'₹'+str(IC_DAILY_LOSS_LIMIT) if IC_DAILY_LOSS_LIMIT > 0 else 'OFF'}")
+    
+    # Log Daily Scalp settings
+    logger.info(f"⚡ Daily Scalp Settings:")
+    logger.info(f"   Lots: {SCALP_NUM_LOTS} ({SCALP_QUANTITY} qty) | Entry: {SCALP_ENTRY_TIME} | Exit: {SCALP_EXIT_TIME}")
+    logger.info(f"   Target: {SCALP_TARGET_PERCENT}% | SL: {SCALP_STOP_LOSS_PERCENT}% | Spot SL: ±{SCALP_SPOT_SL_POINTS}pts")
+    logger.info(f"   Trail: {SCALP_TRAIL_ENABLED} ({SCALP_TRAIL_ACTIVATE_PCT}%/{SCALP_TRAIL_OFFSET_PCT}%) | VIX: {SCALP_MIN_VIX}-{SCALP_MAX_VIX}")
+    logger.info(f"   Min Premium: {SCALP_MIN_PREMIUM}")
     
     # Log expiry info
     if CUSTOM_EXPIRY:
@@ -1923,10 +2264,12 @@ def bot_thread():
     api = BreezeAPI()
     ic = IronCondor(api)
     straddle = ShortStraddle(api)
+    scalp = DailyScalp(api)
     
     # Set global references for live P&L API
     _live_ic = ic
     _live_straddle = straddle
+    _live_scalp = scalp
     
     # === POSITION RECOVERY ON RESTART ===
     # If there was an active position stored from before a restart, recover it
@@ -1981,6 +2324,29 @@ def bot_thread():
                 straddle.spot_at_entry = stored_str.get("spot_at_entry", 0)
                 
                 logger.info(f"🔄 Recovered Straddle position: Strike={stored_str['strike']}, Premium={straddle.entry_premium}")
+        
+        if pos_data.get("daily_scalp") and pos_data["daily_scalp"]:
+            stored_scalp = pos_data["daily_scalp"]
+            if stored_scalp.get("strike"):
+                expiry_str = stored_scalp.get("expiry", "")
+                try:
+                    expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d") if expiry_str else get_next_expiry()
+                except:
+                    expiry_dt = get_next_expiry()
+                
+                scalp.position = {
+                    "strike": stored_scalp["strike"],
+                    "expiry": expiry_dt, "expiry_str": expiry_str
+                }
+                scalp.entry_premium = stored_scalp.get("entry_premium", 0)
+                scalp.entry_prices = stored_scalp.get("entry_prices", {})
+                scalp.entry_time = stored_scalp.get("entry_time", "")
+                scalp.spot_at_entry = stored_scalp.get("spot_at_entry", 0)
+                scalp.vix_at_entry = stored_scalp.get("vix_at_entry")
+                scalp.peak_pnl_pct = stored_scalp.get("peak_pnl_pct", 0)
+                
+                logger.info(f"🔄 Recovered Scalp position: Strike={stored_scalp['strike']}, Premium={scalp.entry_premium}")
+                telegram.send(f"🔄 Recovered Scalp position after restart\nStrike={stored_scalp['strike']}\nPremium: ₹{scalp.entry_premium:.0f}")
     except Exception as e:
         logger.error(f"Position recovery error: {e}")
     
@@ -2017,7 +2383,8 @@ def bot_thread():
                 trading_window = "YES" if is_trading_time() else "NO"
                 logger.info(f"📊 Status: Bot={'ON' if bot_running else 'OFF'}, Market={market_status}, "
                            f"Entry Window={trading_window}, Time={current_time} IST, "
-                           f"IC Position={bool(ic.position)}, Straddle Position={bool(straddle.position)}")
+                           f"IC Position={bool(ic.position)}, Straddle Position={bool(straddle.position)}, "
+                           f"Scalp Position={bool(scalp.position)}")
                 last_status_log = datetime.now()
             
             if not bot_running:
@@ -2043,7 +2410,7 @@ def bot_thread():
                 time.sleep(60)
                 continue
             
-            # Force exit time
+            # Force exit time (for IC and straddle — scalp has its own exit time)
             if is_exit_time():
                 if ic.position:
                     logger.info("⏰ Exit time reached - closing Iron Condor")
@@ -2051,6 +2418,10 @@ def bot_thread():
                 if straddle.position:
                     logger.info("⏰ Exit time reached - closing Straddle")
                     straddle.exit("TIME_EXIT")
+                # Scalp should already be closed by SCALP_EXIT_TIME, but safety check
+                if scalp.position:
+                    logger.info("⏰ Market exit time - force closing Daily Scalp")
+                    scalp.exit("TIME_EXIT")
                 time.sleep(60)
                 continue
             
@@ -2066,6 +2437,13 @@ def bot_thread():
                 if reason:
                     logger.info(f"📊 Straddle exit triggered: {reason}")
                     straddle.exit(reason)
+            
+            # Daily Scalp exit check (independent timing)
+            if strategy in ["daily_scalp", "both"] and scalp.position:
+                reason = scalp.check_exit()
+                if reason:
+                    logger.info(f"⚡ Scalp exit triggered: {reason}")
+                    scalp.exit(reason)
             
             # Enter new positions (during entry window)
             if is_trading_time():
@@ -2099,6 +2477,17 @@ def bot_thread():
                             logger.info("✅ Straddle position opened")
                         else:
                             logger.info("⚠️ Straddle entry skipped (low premium or API issue)")
+                    
+                    # Enter Daily Scalp if no position (uses its own entry time check)
+                    if strategy in ["daily_scalp", "both"] and not scalp.position and not daily_loss_exceeded:
+                        now_ist = get_ist_now()
+                        scalp_time = now_ist.strftime("%H:%M")
+                        if scalp_time >= SCALP_ENTRY_TIME and scalp_time < SCALP_EXIT_TIME:
+                            logger.info("⚡ Attempting Daily Scalp entry...")
+                            if scalp.enter(spot, expiry):
+                                logger.info("✅ Daily Scalp position opened")
+                            else:
+                                logger.info("⚠️ Daily Scalp entry skipped")
                 else:
                     logger.warning("⚠️ Could not get spot price")
             
@@ -3444,16 +3833,18 @@ def api_position():
 # Global references for live P&L (set by bot_thread)
 _live_ic = None
 _live_straddle = None
+_live_scalp = None
 
 @app.route('/api/live_pnl')
 def api_live_pnl():
     """Get real-time P&L for active positions"""
-    global _live_ic, _live_straddle
+    global _live_ic, _live_straddle, _live_scalp
     
     strategy = request.args.get("strategy", "all")
     result = {
         "iron_condor": None,
-        "straddle": None
+        "straddle": None,
+        "daily_scalp": None
     }
     
     # Try to get live P&L from strategy instances
@@ -3467,8 +3858,13 @@ def api_live_pnl():
         if pnl_data:
             result["straddle"] = pnl_data
     
+    if strategy in ["daily_scalp", "all"] and _live_scalp and _live_scalp.position:
+        pnl_data = _live_scalp.get_live_pnl()
+        if pnl_data:
+            result["daily_scalp"] = pnl_data
+    
     # Fallback to stored position data if live not available
-    if not result["iron_condor"] and not result["straddle"]:
+    if not result["iron_condor"] and not result["straddle"] and not result["daily_scalp"]:
         pos_data = load_position()
         if pos_data.get("iron_condor"):
             result["iron_condor"] = {
@@ -3489,6 +3885,18 @@ def api_live_pnl():
                 "target_pct": STR_TARGET_PERCENT,
                 "stoploss_pct": STR_STOP_LOSS_PERCENT,
                 "current_prices": pos_data["straddle"].get("entry_prices", {})
+            }
+        if pos_data.get("daily_scalp"):
+            result["daily_scalp"] = {
+                "entry_premium": pos_data["daily_scalp"].get("entry_premium", 0),
+                "current_premium": pos_data["daily_scalp"].get("entry_premium", 0),
+                "pnl_amount": 0,
+                "pnl_percent": 0,
+                "target_pct": SCALP_TARGET_PERCENT,
+                "stoploss_pct": SCALP_STOP_LOSS_PERCENT,
+                "current_prices": pos_data["daily_scalp"].get("entry_prices", {}),
+                "spot_at_entry": pos_data["daily_scalp"].get("spot_at_entry", 0),
+                "spot_sl_points": SCALP_SPOT_SL_POINTS
             }
     
     return jsonify(result)
@@ -3660,7 +4068,18 @@ def api_settings():
             "ic_spot_buffer": IC_SPOT_BUFFER,
             "ic_avoid_expiry_day": IC_AVOID_EXPIRY_DAY,
             "ic_reentry_after_sl": IC_REENTRY_AFTER_SL,
-            "ic_daily_loss_limit": IC_DAILY_LOSS_LIMIT
+            "ic_daily_loss_limit": IC_DAILY_LOSS_LIMIT,
+            "scalp_num_lots": SCALP_NUM_LOTS,
+            "scalp_quantity": SCALP_QUANTITY,
+            "scalp_target_percent": SCALP_TARGET_PERCENT,
+            "scalp_stop_loss_percent": SCALP_STOP_LOSS_PERCENT,
+            "scalp_entry_time": SCALP_ENTRY_TIME,
+            "scalp_exit_time": SCALP_EXIT_TIME,
+            "scalp_spot_sl_points": SCALP_SPOT_SL_POINTS,
+            "scalp_trail_enabled": SCALP_TRAIL_ENABLED,
+            "scalp_min_premium": SCALP_MIN_PREMIUM,
+            "scalp_max_vix": SCALP_MAX_VIX,
+            "scalp_min_vix": SCALP_MIN_VIX
         })
     return jsonify({"status": "settings are read-only, configure via environment variables"})
 
