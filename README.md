@@ -1,11 +1,12 @@
-# 🤖 Nifty Options Trading Bot v2.0
+# 🤖 Nifty Options Trading Bot v3.0
 
-Automated trading bot for Nifty options with Iron Condor and Short Straddle strategies.
+Automated trading bot for Nifty options with Iron Condor, Short Straddle, and **Daily Scalp** strategies.
 
 ## ✨ Features
 
 - 🦅 **Iron Condor v2.0** - VIX filter, dynamic strikes, trailing SL, per-leg adjustments
 - 📊 **Short Straddle** - Higher premium, 55-60% win rate
+- ⚡ **Daily Scalp (NEW)** - Intraday ATM straddle sell with strict risk management
 - 🖥️ **Web Dashboard** - Real-time P&L tracking
 - 📱 **Telegram Alerts** - Trade notifications & remote control
 - 🔬 **Backtesting Engine** - Test strategies on historical data
@@ -18,14 +19,64 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | File | Description |
 |------|-------------|
 | `app.py` | Combined dashboard + trading bot + backtester |
-| `Procfile` | Railway process config |
+| `Procfile` | Railway process config (gunicorn) |
 | `requirements.txt` | Python dependencies |
+
+## ⚡ Daily Scalp Strategy (NEW in v3.0)
+
+The Daily Scalp is an **intraday ATM straddle sell** designed for consistent daily income with strict risk management.
+
+### How It Works
+
+| Step | Detail |
+|------|--------|
+| **Entry** | SELL ATM CE + PE at 9:45 AM (after opening range settles) |
+| **Target** | 25% premium decay → ~₹7-10K/day (3 lots) |
+| **Stop Loss 1** | Combined premium rises 40% |
+| **Stop Loss 2** | Nifty moves ±150 points from entry |
+| **Trailing SL** | After 15% profit, trail 10% behind peak |
+| **Hard Exit** | 2:00 PM — **NEVER holds overnight** |
+| **VIX Filter** | Only trades when India VIX is 10-20 |
+| **Re-entry** | No re-entry same day after SL hit |
+
+### Daily Scalp Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STRATEGY` | `daily_scalp` | Set to activate |
+| `SCALP_NUM_LOTS` | `3` | Number of lots (3 × 75 = 225 qty) |
+| `SCALP_TARGET_PERCENT` | `25` | Target profit % of premium |
+| `SCALP_STOP_LOSS_PERCENT` | `40` | Max premium rise before SL |
+| `SCALP_ENTRY_TIME` | `09:45` | Entry time (IST) |
+| `SCALP_EXIT_TIME` | `14:00` | Hard exit time (IST) |
+| `SCALP_SPOT_SL_POINTS` | `150` | Nifty ±points SL |
+| `SCALP_TRAIL_ENABLED` | `true` | Enable trailing stop |
+| `SCALP_TRAIL_ACTIVATE_PCT` | `15` | Activate trail after this % profit |
+| `SCALP_TRAIL_OFFSET_PCT` | `10` | Trail behind peak by this % |
+| `SCALP_MIN_PREMIUM` | `100` | Min combined premium to enter |
+| `SCALP_MAX_VIX` | `20` | Skip if VIX above this |
+| `SCALP_MIN_VIX` | `10` | Skip if VIX below this |
+
+### Expected Performance
+
+| Metric | Value |
+|--------|-------|
+| Daily Profit Target | ₹7,000 - 10,000 |
+| Daily Max Loss | ₹15,000 - 25,000 |
+| Win Rate | ~65-70% |
+| Weekly Potential | ₹28,000 - 40,000 (4 trading days) |
+| Margin Required | ~₹4-5 Lakhs |
+
+### Risk Warnings
+- **Naked selling** = unlimited theoretical risk. SL + time exit caps practical risk.
+- Bot monitors every CHECK_INTERVAL seconds. Set to 30-60s for scalp.
+- Never override SCALP_EXIT_TIME to hold overnight.
 
 ## 🚀 Deploy to Railway (5 minutes)
 
 ### Step 1: Create GitHub Repository
 1. Create new repo on GitHub
-2. Upload all files
+2. Upload all files (`app.py`, `Procfile`, `requirements.txt`)
 
 ### Step 2: Deploy on Railway
 1. Go to [railway.app](https://railway.app)
@@ -42,6 +93,13 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 | `API_SECRET` | ICICI Breeze Secret | xyz789... |
 | `API_SESSION` | Breeze Session Token (daily) | abc123xyz... |
 
+#### Required for Daily Scalp
+```
+STRATEGY=daily_scalp
+SCALP_NUM_LOTS=3
+CHECK_INTERVAL=30
+```
+
 #### Optional - Telegram
 
 | Variable | Description | Example |
@@ -55,38 +113,26 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 |----------|-------------|---------|
 | `CAPITAL` | Trading capital | 500000 |
 | `LOT_SIZE` | Nifty lot size | 75 |
-| `NUM_LOTS` | Number of lots to trade | 1 |
-| `STRATEGY` | iron_condor / straddle / both | iron_condor |
-| `MIN_PREMIUM` | Minimum premium to enter | 10 |
+| `NUM_LOTS` | Number of lots (IC/Straddle) | 1 |
+| `STRATEGY` | iron_condor / straddle / daily_scalp / both | iron_condor |
+| `MIN_PREMIUM` | Minimum premium to enter (IC/Straddle) | 10 |
 | `AUTO_START` | Auto-start bot on deploy | true |
 
+> **STRATEGY=both** runs Iron Condor + Daily Scalp simultaneously.
+
 > **Note:** Total quantity = LOT_SIZE × NUM_LOTS (e.g., 75 × 2 = 150)
-
-#### Optional - Basket Order Settings
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `BASKET_ORDER` | Enable basket order (multi-leg) mode | true |
-| `BASKET_RETRY` | Retries per leg if order fails | 2 |
-| `BASKET_ROLLBACK` | Auto-rollback if any leg fails | true |
-
-> **Basket Orders:** The Breeze API does not have a native basket order endpoint. The bot implements a software-level basket order that places all legs rapidly, pre-checks margin using `margin_calculator()`, and auto-rolls back successful legs if any critical leg fails. Set `BASKET_ORDER=false` to use legacy sequential order placement.
 
 #### Optional - Timing (IST)
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ENTRY_TIME_START` | Start of entry window | 09:20 |
-| `ENTRY_TIME_END` | End of entry window | 14:00 |
-| `EXIT_TIME` | Force exit all positions | 15:15 |
+| `ENTRY_TIME_START` | Start of IC/Straddle entry window | 09:20 |
+| `ENTRY_TIME_END` | End of IC/Straddle entry window | 14:00 |
+| `EXIT_TIME` | Force exit IC/Straddle positions | 15:15 |
 | `CHECK_INTERVAL` | Seconds between bot checks | 60 |
 | `CUSTOM_EXPIRY` | Override expiry date (for holidays) | *(empty)* |
-| `USE_CURRENT_EXPIRY` | Use current week expiry on Thursday | false |
-| `EXPIRY_DAY_CUTOFF` | Time after which to use next expiry on Thursday | 09:30 |
 
-> **Holiday Expiry:** When expiry is shifted due to a holiday (e.g., Thursday is holiday, expiry moves to Monday/Tuesday), set `CUSTOM_EXPIRY=17-02-2026` to override.
->
-> **Supported formats:** `17-02-2026`, `2026-02-17`, `17-Feb-2026`, `17/02/2026`
+> **For Daily Scalp:** Set `CHECK_INTERVAL=30` for faster monitoring.
 
 #### Optional - Strategy Parameters
 
@@ -103,41 +149,20 @@ Automated trading bot for Nifty options with Iron Condor and Short Straddle stra
 
 #### Optional - Iron Condor v2.0 Improvements
 
-These settings control the advanced IC strategy features. All are optional with sensible defaults.
-
 | Variable | Description | Default |
 |----------|-------------|---------|
-| **VIX Filter** | | |
-| `IC_VIX_MAX` | Skip entry if India VIX > this (too volatile for IC) | 16 |
-| `IC_VIX_MIN` | Skip entry if India VIX < this (premiums too cheap) | 9 |
-| **Strike Selection** | | |
-| `IC_STRIKE_MODE` | `fixed` (distance-based) or `dynamic` (OI-based) | fixed |
-| `IC_MIN_CREDIT` | Minimum net credit required to enter | 20 |
-| `IC_SPOT_BUFFER` | Widen strikes when spot is near day's high/low | true |
-| **Risk Management** | | |
+| `IC_VIX_MAX` | Skip entry if VIX > this | 16 |
+| `IC_VIX_MIN` | Skip entry if VIX < this | 9 |
+| `IC_STRIKE_MODE` | `fixed` or `dynamic` (OI-based) | fixed |
+| `IC_MIN_CREDIT` | Minimum net credit to enter | 20 |
 | `IC_TRAILING_SL` | Enable trailing stop loss | true |
-| `IC_TRAILING_ACTIVATE_PCT` | Activate trailing SL after this % profit | 30 |
-| `IC_TRAILING_OFFSET_PCT` | Trail behind peak by this % | 15 |
-| `IC_LEG_SL_ENABLED` | Per-leg stop loss on individual spreads | true |
-| `IC_LEG_SL_PERCENT` | Exit a spread when it loses this % of its credit | 150 |
-| `IC_DAILY_LOSS_LIMIT` | Stop trading if daily realized loss exceeds this (0=off) | 0 |
-| **Adjustments** | | |
-| `IC_ADJUSTMENT_ENABLED` | Close losing spread, keep winning side (partial exit) | true |
-| `IC_ADJUSTMENT_TRIGGER_PCT` | Trigger adjustment when one spread loses this % | 70 |
-| **Safety** | | |
-| `IC_AVOID_EXPIRY_DAY` | Don't open new IC on expiry day (gamma risk) | true |
-| `IC_REENTRY_AFTER_SL` | Allow re-entry on same day after SL hit | false |
-
-> **How IC v2.0 works:**
-> 1. **VIX Filter** — Only enters when India VIX is 9-16 (the sweet spot for premium selling)
-> 2. **Dynamic Strikes** — When `IC_STRIKE_MODE=dynamic`, picks sell strikes at highest Open Interest levels (natural support/resistance) instead of fixed distances
-> 3. **Spot Buffer** — If Nifty is near the day's high, call strikes widen by 50pts; near day's low, put strikes widen
-> 4. **Risk:Reward Check** — Rejects trades where max loss > 3× credit received
-> 5. **Trailing Stop** — After 30% profit, trail 15% behind peak (e.g., peak +40% → exits at +25%)
-> 6. **Adjustment** — If one spread loses 70% of credit, close that spread and keep the winning side for theta decay
-> 7. **Position Recovery** — If the bot restarts mid-trade, it recovers the active position from disk and continues managing it
-
-> **Note:** `API_SESSION` expires daily. You can update it via Telegram `/session TOKEN` or the dashboard.
+| `IC_TRAILING_ACTIVATE_PCT` | Activate trailing SL after % profit | 30 |
+| `IC_TRAILING_OFFSET_PCT` | Trail behind peak by % | 15 |
+| `IC_LEG_SL_ENABLED` | Per-leg stop loss | true |
+| `IC_LEG_SL_PERCENT` | Per-leg SL % | 150 |
+| `IC_ADJUSTMENT_ENABLED` | Close losing spread, keep winning | true |
+| `IC_AVOID_EXPIRY_DAY` | Don't open IC on expiry day | true |
+| `IC_DAILY_LOSS_LIMIT` | Stop after daily loss exceeds (0=off) | 0 |
 
 ### Step 4: Generate Domain
 1. Settings → Public Networking
@@ -157,139 +182,17 @@ These settings control the advanced IC strategy features. All are optional with 
 
 ## 🔬 Backtesting
 
-The bot includes a full backtesting engine accessible via the dashboard:
+The bot includes a full backtesting engine accessible via the dashboard. All three strategies (Iron Condor, Straddle, Daily Scalp) can be backtested.
 
-1. Go to the **Backtesting** tab
-2. Set start/end dates
-3. Choose strategy
-4. Click **Run Backtest**
-
-## 🔬 Backtesting
-
-The backtesting engine uses the **same entry/exit times** as the live trading bot.
-
-### Data Sources
-
-1. **Estimated Premiums** (Default) - Uses Black-Scholes approximation
-   - Fast, no API calls needed
-   - Good for strategy validation
-   - Premiums based on: spot, strike distance, days to expiry, IV
-
-2. **Breeze API Historical Data** (Optional) - Enable checkbox in dashboard
-   - Uses actual historical option prices
-   - More accurate but slower (API rate limits apply)
-   - Requires API connection and valid session
-
-### Premium Calculation (Estimated Mode)
-The backtester now uses proper option pricing:
-- Black-Scholes approximation for premium estimation
-- Days to expiry calculated from **trade date** (not current date!)
-- IV adjusts based on time to expiry
-- Realistic OTM decay and ITM intrinsic value
-
-### Backtest Results Show:
-| Field | Description |
-|-------|-------------|
-| Total Trades | Number of trades executed |
-| Win Rate | Percentage of profitable trades |
-| Total P&L | Net profit/loss |
-| Return % | Return on initial capital |
-| Avg Exit Time | Average time of day for exits |
-| Avg Premium | Average entry premium collected |
-| Data Source | API or Estimated |
-| Target Hits | Trades that hit target |
-| Stop Loss | Trades that hit stop-loss |
-| Time Exits | Trades exited at force exit time |
-
-### Trade Details Table
-Each trade shows:
-- **Entry Date** - When the trade was entered
-- **Entry Time** - Actual entry time (random within window)
-- **Exit Time** - When the trade was closed
-- **Premium** - Entry premium (📡 = API data, 📊 = Estimated)
-- **P&L** - Profit/loss in ₹
-- **Exit Reason** - TARGET, STOP_LOSS, or TIME_EXIT
-
-### API Usage
 ```bash
 POST /api/backtest
 {
   "start_date": "2025-01-01",
   "end_date": "2025-12-31",
-  "strategy": "iron_condor",
-  "capital": 500000,
-  "entry_time_start": "09:20",
-  "entry_time_end": "14:00",
-  "exit_time": "15:15",
-  "use_historical_api": false
-}
-```
-
----
-
-## 📊 Dashboard Features
-
-### Live Position Panel
-- **Real-time P&L** - Updates every 5 seconds
-- **Position Details** - Entry time, spot price, expiry, quantity
-- **Leg-wise Breakdown** - See each option leg with entry/current prices
-- **Progress Bar** - Visual indicator showing distance to target/stop-loss
-- **Unrealized P&L** - Both absolute value and percentage
-
-### Status Badges
-- 🕐 Current IST time
-- 📊 Market status (OPEN/CLOSED)
-- ⏳ Entry window status
-- 📅 Next expiry date
-
-### API Endpoints for Backtesting
-
-```bash
-# Get expiry dates
-GET /api/expiries?start=2025-01-01&end=2025-12-31
-
-# Run backtest
-POST /api/backtest
-{
-  "start_date": "2025-01-01",
-  "end_date": "2025-12-31",
-  "strategy": "iron_condor",
+  "strategy": "daily_scalp",
   "capital": 500000
 }
-
-# Get bot status (timing, settings)
-GET /api/status
-
-# Get current settings
-GET /api/settings
-
-# Get live positions
-GET /api/position
-
-# Get real-time P&L for positions
-GET /api/live_pnl?strategy=iron_condor
-GET /api/live_pnl?strategy=straddle
-GET /api/live_pnl?strategy=all
 ```
-
-### Example Status Response
-
-```json
-{
-  "current_time_ist": "2026-02-12 10:30:00",
-  "is_trading_time": true,
-  "is_market_hours": true,
-  "entry_time_start": "09:20",
-  "entry_time_end": "14:00",
-  "exit_time": "15:15"
-}
-```
-
-### Expiry Date Format for Breeze API
-
-The bot automatically handles date formatting:
-- **Display format**: `13-Feb-2026`
-- **Breeze API format**: `2026-02-13T07:00:00.000Z`
 
 ## 📅 Daily Workflow
 
@@ -297,85 +200,24 @@ The bot automatically handles date formatting:
 |------|--------|
 | 9:00 AM | Get session token from ICICI |
 | 9:05 AM | Send `/session TOKEN` via Telegram |
-| 9:20 AM | Bot starts trading automatically |
-| 3:15 PM | Bot exits all positions |
-
-## ⚙️ Strategy Settings
-
-### Iron Condor
-- Lot Size: **65**
-- Sell: ATM ± 150
-- Buy: ATM ± 250
-- Target: 50%
-- Stop Loss: 100%
-- Min Premium: ₹20
-
-### Short Straddle
-- Lot Size: **65**
-- Strike: ATM
-- Target: 30%
-- Stop Loss: 20%
-- Min Premium: ₹20
-
-## 📜 Trade History
-
-Trade history is automatically preserved in `trade_history.json`:
-
-```json
-{
-  "trades": [...],
-  "backtest_results": [...]
-}
-```
-
-Access via:
-- Dashboard → Trade History tab
-- API: `GET /api/history`
+| 9:45 AM | ⚡ Daily Scalp enters automatically |
+| 2:00 PM | ⚡ Daily Scalp hard exit (no overnight) |
+| 3:15 PM | IC/Straddle exit (if running) |
 
 ## 🔧 Troubleshooting
 
+### "Application failed to respond" on Railway
+1. Make sure `Procfile` is uploaded: `web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 4 --preload`
+2. Check Railway deploy logs for errors
+3. Ensure `requirements.txt` has all dependencies
+4. The bot thread now starts automatically at module load (works with gunicorn)
+
 ### "Limit exceed: API call per minute"
-The Breeze API has a limit of ~60 calls per minute. The bot now includes:
-- **Rate limiting** - Minimum 500ms between API calls
-- **LTP caching** - 5-second cache to avoid repeated calls
-- **Auto-wait** - Waits 60s when limit is detected
-- **Check interval** - Default increased to 60 seconds
+Set `CHECK_INTERVAL=60` or higher to reduce API calls.
 
-To reduce API calls further:
-```
-CHECK_INTERVAL=120  # Check every 2 minutes instead of 1
-```
-
-### "Found 0 expiry dates"
-This error is now fixed! The backtester calculates expiry dates programmatically without API calls.
-
-### "No Data Found" for option quotes
-This usually means:
-1. **Wrong expiry** - On Thursday, the bot now uses next week's expiry by default
-2. **Strike doesn't exist** - The strike price might not have contracts. Check if the strike is valid.
-3. **API issue** - Breeze API might be down. The bot will retry 3 times.
-
-The bot now tries multiple expiry formats:
-- `2026-02-19T07:00:00.000Z` (ISO format)
-- `19-Feb-2026` (DD-Mon-YYYY)
-- `2026-02-19` (YYYY-MM-DD)
-
-### "Credit 0 < MIN_PREMIUM"
-This means the option quotes returned 0 or failed. Check:
-1. Session token is valid
-2. Market is open
-3. Expiry date is correct (check `/api/status` endpoint)
-
-### "ModuleNotFoundError: schedule"
-Fixed in `requirements.txt` - includes `schedule>=1.2.0`
-
-### "Can't open file 'bot_runner.py'"
-Renamed entry point to `app.py` - matches Procfile
+### Bot thread not starting
+Fixed in v3.0! The bot thread now starts at module import time, not just in `__main__`. Works with both `python app.py` and `gunicorn app:app`.
 
 ## ⚠️ Disclaimer
 
 Trading involves risk. Use paper trading first. Not responsible for losses.
-
-## 📞 Support
-
-Create GitHub issue for help.

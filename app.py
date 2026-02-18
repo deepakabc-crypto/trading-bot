@@ -4084,14 +4084,27 @@ def api_settings():
     return jsonify({"status": "settings are read-only, configure via environment variables"})
 
 # ============================================
-# MAIN
+# START BOT THREAD (works with both gunicorn and direct run)
+# ============================================
+# Start bot in background thread at module load time
+# This ensures it runs whether started via gunicorn or python app.py
+_bot_thread_started = False
+
+def start_bot_thread():
+    global _bot_thread_started
+    if not _bot_thread_started:
+        _bot_thread_started = True
+        bot = threading.Thread(target=bot_thread, daemon=True)
+        bot.start()
+        logger.info("🤖 Bot thread started")
+
+# Auto-start bot thread on import (for gunicorn)
+start_bot_thread()
+
+# ============================================
+# MAIN (for direct python app.py)
 # ============================================
 if __name__ == '__main__':
-    # Start bot in background thread
-    bot = threading.Thread(target=bot_thread, daemon=True)
-    bot.start()
-    logger.info("🤖 Bot thread started")
-    
     # Start Flask app
     logger.info(f"🖥️ Dashboard starting on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
