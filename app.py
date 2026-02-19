@@ -2221,7 +2221,7 @@ def is_market_hours():
     return "09:15" <= current_time <= "15:30"
 
 def bot_thread():
-    global _live_ic, _live_straddle, _live_scalp
+    global _live_ic, _live_scalp
     
     logger.info("🤖 Bot thread starting...")
     logger.info(f"⏰ Entry Time: {ENTRY_TIME_START} - {ENTRY_TIME_END} IST")
@@ -2263,12 +2263,10 @@ def bot_thread():
     
     api = BreezeAPI()
     ic = IronCondor(api)
-    straddle = ShortStraddle(api)
     scalp = DailyScalp(api)
     
     # Set global references for live P&L API
     _live_ic = ic
-    _live_straddle = straddle
     _live_scalp = scalp
     
     # === POSITION RECOVERY ON RESTART ===
@@ -2304,26 +2302,6 @@ def bot_thread():
                 
                 logger.info(f"🔄 Recovered IC position: SC={strikes['sell_call']}, SP={strikes['sell_put']}, Credit={ic.entry_premium}")
                 telegram.send(f"🔄 Recovered IC position after restart\nSC={strikes['sell_call']}CE / SP={strikes['sell_put']}PE\nCredit: ₹{ic.entry_premium:.0f}")
-        
-        if pos_data.get("straddle") and pos_data["straddle"]:
-            stored_str = pos_data["straddle"]
-            if stored_str.get("strike"):
-                expiry_str = stored_str.get("expiry", "")
-                try:
-                    expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d") if expiry_str else get_next_expiry()
-                except:
-                    expiry_dt = get_next_expiry()
-                
-                straddle.position = {
-                    "strike": stored_str["strike"],
-                    "expiry": expiry_dt, "expiry_str": expiry_str
-                }
-                straddle.entry_premium = stored_str.get("entry_premium", 0)
-                straddle.entry_prices = stored_str.get("entry_prices", {})
-                straddle.entry_time = stored_str.get("entry_time", "")
-                straddle.spot_at_entry = stored_str.get("spot_at_entry", 0)
-                
-                logger.info(f"🔄 Recovered Straddle position: Strike={stored_str['strike']}, Premium={straddle.entry_premium}")
         
         if pos_data.get("daily_scalp") and pos_data["daily_scalp"]:
             stored_scalp = pos_data["daily_scalp"]
@@ -2383,8 +2361,7 @@ def bot_thread():
                 trading_window = "YES" if is_trading_time() else "NO"
                 logger.info(f"📊 Status: Bot={'ON' if bot_running else 'OFF'}, Market={market_status}, "
                            f"Entry Window={trading_window}, Time={current_time} IST, "
-                           f"IC Position={bool(ic.position)}, Straddle Position={bool(straddle.position)}, "
-                           f"Scalp Position={bool(scalp.position)}")
+                           f"IC Position={bool(ic.position)}, Scalp Position={bool(scalp.position)}")
                 last_status_log = datetime.now()
             
             if not bot_running:
@@ -2410,14 +2387,11 @@ def bot_thread():
                 time.sleep(60)
                 continue
             
-            # Force exit time (for IC and straddle — scalp has its own exit time)
+            # Force exit time (for IC — scalp has its own exit time)
             if is_exit_time():
                 if ic.position:
                     logger.info("⏰ Exit time reached - closing Iron Condor")
                     ic.exit("TIME_EXIT")
-                if straddle.position:
-                    logger.info("⏰ Exit time reached - closing Straddle")
-                    straddle.exit("TIME_EXIT")
                 # Scalp should already be closed by SCALP_EXIT_TIME, but safety check
                 if scalp.position:
                     logger.info("⏰ Market exit time - force closing Daily Scalp")
@@ -2431,12 +2405,6 @@ def bot_thread():
                 if reason:
                     logger.info(f"🦅 IC exit triggered: {reason}")
                     ic.exit(reason)
-            
-            if strategy in ["straddle", "both"] and straddle.position:
-                reason = straddle.check_exit()
-                if reason:
-                    logger.info(f"📊 Straddle exit triggered: {reason}")
-                    straddle.exit(reason)
             
             # Daily Scalp exit check (independent timing)
             if strategy in ["daily_scalp", "both"] and scalp.position:
@@ -2469,14 +2437,6 @@ def bot_thread():
                             logger.info("✅ Iron Condor position opened")
                         else:
                             logger.info("⚠️ Iron Condor entry skipped (low premium or API issue)")
-                    
-                    # Enter Straddle if no position
-                    if strategy in ["straddle", "both"] and not straddle.position and not daily_loss_exceeded:
-                        logger.info("📊 Attempting Straddle entry...")
-                        if straddle.enter(spot, expiry):
-                            logger.info("✅ Straddle position opened")
-                        else:
-                            logger.info("⚠️ Straddle entry skipped (low premium or API issue)")
                     
                     # Enter Daily Scalp if no position (uses its own entry time check)
                     if strategy in ["daily_scalp", "both"] and not scalp.position and not daily_loss_exceeded:
@@ -2928,62 +2888,87 @@ DASHBOARD_HTML = """
                         </div>
                     </div>
                     
-                    <!-- Straddle Position -->
-                    <div id="str-position" class="position-card" style="display: none;">
+                    <!-- Daily Scalp Position -->
+                    <div id="scalp-position" class="position-card" style="display: none;">
                         <div class="position-header">
-                            <span class="position-strategy">📊 SHORT STRADDLE</span>
-                            <span class="position-pnl" id="str-pnl">₹0</span>
+                            <span class="position-strategy">⚡ DAILY SCALP <span style="font-size:0.65rem;background:#ff9800;padding:2px 6px;border-radius:8px;margin-left:5px;color:#000;">INTRADAY</span></span>
+                            <span class="position-pnl" id="scalp-pnl">₹0</span>
                         </div>
                         <div class="position-details">
                             <div class="position-row">
                                 <span>Entry Time:</span>
-                                <span id="str-entry-time">--</span>
+                                <span id="scalp-entry-time">--</span>
                             </div>
                             <div class="position-row">
                                 <span>Strike:</span>
-                                <span id="str-strike">--</span>
+                                <span id="scalp-strike">--</span>
                             </div>
                             <div class="position-row">
                                 <span>Spot at Entry:</span>
-                                <span id="str-spot-entry">--</span>
+                                <span id="scalp-spot-entry">--</span>
                             </div>
                             <div class="position-row">
                                 <span>Expiry:</span>
-                                <span id="str-expiry">--</span>
+                                <span id="scalp-expiry">--</span>
                             </div>
                             <div class="position-row">
                                 <span>Quantity:</span>
-                                <span id="str-qty">--</span>
+                                <span id="scalp-qty">--</span>
+                            </div>
+                            <div class="position-row">
+                                <span>VIX at Entry:</span>
+                                <span id="scalp-vix-entry">--</span>
                             </div>
                         </div>
                         <table class="position-table">
                             <thead>
                                 <tr><th>Leg</th><th>Entry</th><th>Current</th><th>P&L</th></tr>
                             </thead>
-                            <tbody id="str-legs">
+                            <tbody id="scalp-legs">
                             </tbody>
                         </table>
+                        <!-- Spot Movement Tracker -->
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:15px;">
+                            <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:10px;text-align:center;">
+                                <div style="font-size:0.7rem;color:#888;margin-bottom:4px;">📍 SPOT MOVE</div>
+                                <div id="scalp-spot-move" style="font-size:1rem;font-weight:600;">0 pts</div>
+                                <div style="font-size:0.65rem;color:#888;margin-top:2px;">SL: ±<span id="scalp-spot-sl-display">150</span> pts</div>
+                            </div>
+                            <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:10px;text-align:center;">
+                                <div style="font-size:0.7rem;color:#888;margin-bottom:4px;">⏰ HARD EXIT</div>
+                                <div style="font-size:1rem;font-weight:600;color:#ff9800;">14:00</div>
+                                <div style="font-size:0.65rem;color:#888;margin-top:2px;">No overnight risk</div>
+                            </div>
+                        </div>
                         <div class="position-summary">
                             <div class="summary-item">
                                 <span>Entry Premium:</span>
-                                <span id="str-entry-premium">₹0</span>
+                                <span id="scalp-entry-premium">₹0</span>
                             </div>
                             <div class="summary-item">
                                 <span>Current Premium:</span>
-                                <span id="str-current-premium">₹0</span>
+                                <span id="scalp-current-premium">₹0</span>
                             </div>
                             <div class="summary-item">
                                 <span>Unrealized P&L:</span>
-                                <span id="str-unrealized-pnl" class="pnl-value">₹0</span>
+                                <span id="scalp-unrealized-pnl" class="pnl-value">₹0</span>
                             </div>
                             <div class="summary-item">
                                 <span>P&L %:</span>
-                                <span id="str-pnl-pct">0%</span>
+                                <span id="scalp-pnl-pct">0%</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Peak P&L %:</span>
+                                <span id="scalp-peak-pnl" style="color:#00d2ff;">--</span>
+                            </div>
+                            <div class="summary-item">
+                                <span>Trail SL Level:</span>
+                                <span id="scalp-trailing-sl-level" style="color:#ffa726;">--</span>
                             </div>
                         </div>
                         <div class="position-progress">
                             <div class="progress-bar">
-                                <div class="progress-fill" id="str-progress"></div>
+                                <div class="progress-fill" id="scalp-progress"></div>
                                 <div class="progress-markers">
                                     <span class="marker marker-sl">SL</span>
                                     <span class="marker marker-entry">Entry</span>
@@ -2991,8 +2976,8 @@ DASHBOARD_HTML = """
                                 </div>
                             </div>
                             <div class="progress-labels">
-                                <span id="str-sl-label">-20%</span>
-                                <span id="str-target-label">+30%</span>
+                                <span id="scalp-sl-label">-40%</span>
+                                <span id="scalp-target-label">+25%</span>
                             </div>
                         </div>
                     </div>
@@ -3012,13 +2997,13 @@ DASHBOARD_HTML = """
                         <h4>🦅 Iron Condor</h4>
                         <p>Limited risk • 65-70% win rate</p>
                     </div>
-                    <div class="strategy-btn" data-strategy="straddle" onclick="selectStrategy('straddle')">
-                        <h4>📊 Short Straddle</h4>
-                        <p>Higher premium • 55-60% win rate</p>
+                    <div class="strategy-btn" data-strategy="daily_scalp" onclick="selectStrategy('daily_scalp')">
+                        <h4>⚡ Daily Scalp</h4>
+                        <p>Intraday ATM sell • No overnight</p>
                     </div>
                     <div class="strategy-btn" data-strategy="both" onclick="selectStrategy('both')">
                         <h4>🔄 Both Strategies</h4>
-                        <p>Diversified approach</p>
+                        <p>IC + Daily Scalp together</p>
                     </div>
                 </div>
             </div>
@@ -3079,7 +3064,7 @@ DASHBOARD_HTML = """
                         <label class="info-text">Strategy</label>
                         <select id="bt-strategy">
                             <option value="iron_condor">Iron Condor</option>
-                            <option value="straddle">Short Straddle</option>
+                            <option value="daily_scalp">Daily Scalp</option>
                             <option value="both">Both Strategies</option>
                         </select>
                     </div>
@@ -3328,7 +3313,7 @@ DASHBOARD_HTML = """
         function updatePositions(posData) {
             const section = document.getElementById('position-section');
             const icPos = document.getElementById('ic-position');
-            const strPos = document.getElementById('str-position');
+            const scalpPos = document.getElementById('scalp-position');
             const noPos = document.getElementById('no-position');
             
             // Always show position section
@@ -3336,7 +3321,7 @@ DASHBOARD_HTML = """
             
             if (!posData.has_position) {
                 icPos.style.display = 'none';
-                strPos.style.display = 'none';
+                scalpPos.style.display = 'none';
                 noPos.style.display = 'block';
                 return;
             }
@@ -3412,43 +3397,44 @@ DASHBOARD_HTML = """
                 icPos.style.display = 'none';
             }
             
-            // Straddle Position
-            if (posData.straddle) {
-                strPos.style.display = 'block';
-                const str = posData.straddle;
+            // Daily Scalp Position
+            if (posData.daily_scalp) {
+                scalpPos.style.display = 'block';
+                const sc = posData.daily_scalp;
                 
                 // Entry details
-                document.getElementById('str-entry-time').textContent = str.entry_time ? new Date(str.entry_time).toLocaleTimeString('en-IN') : '--';
-                document.getElementById('str-strike').textContent = str.strike || '--';
-                document.getElementById('str-spot-entry').textContent = str.spot_at_entry ? str.spot_at_entry.toFixed(2) : '--';
-                document.getElementById('str-expiry').textContent = str.expiry || '--';
-                document.getElementById('str-qty').textContent = str.quantity + ' (' + str.num_lots + ' lots)';
+                document.getElementById('scalp-entry-time').textContent = sc.entry_time ? new Date(sc.entry_time).toLocaleTimeString('en-IN') : '--';
+                document.getElementById('scalp-strike').textContent = sc.strike || '--';
+                document.getElementById('scalp-spot-entry').textContent = sc.spot_at_entry ? sc.spot_at_entry.toFixed(2) : '--';
+                document.getElementById('scalp-expiry').textContent = sc.expiry || '--';
+                document.getElementById('scalp-qty').textContent = sc.quantity + ' (' + sc.num_lots + ' lots)';
+                document.getElementById('scalp-vix-entry').textContent = sc.vix_at_entry ? sc.vix_at_entry.toFixed(1) : 'N/A';
                 
                 // Entry premium
-                const entryPremium = str.entry_premium || 0;
-                document.getElementById('str-entry-premium').textContent = '₹' + entryPremium.toFixed(2);
+                const entryPremium = sc.entry_premium || 0;
+                document.getElementById('scalp-entry-premium').textContent = '₹' + entryPremium.toFixed(2);
                 
                 // Legs table
-                const entryPrices = str.entry_prices || {};
-                document.getElementById('str-legs').innerHTML = `
+                const entryPrices = sc.entry_prices || {};
+                document.getElementById('scalp-legs').innerHTML = `
                     <tr>
-                        <td style="color:#ff5252;">SELL ${str.strike} CE</td>
+                        <td style="color:#ff5252;">SELL ${sc.strike} CE</td>
                         <td>₹${(entryPrices.ce || 0).toFixed(2)}</td>
-                        <td id="str-ce-ltp">--</td>
-                        <td id="str-ce-pnl">--</td>
+                        <td id="scalp-ce-ltp">--</td>
+                        <td id="scalp-ce-pnl">--</td>
                     </tr>
                     <tr>
-                        <td style="color:#ff5252;">SELL ${str.strike} PE</td>
+                        <td style="color:#ff5252;">SELL ${sc.strike} PE</td>
                         <td>₹${(entryPrices.pe || 0).toFixed(2)}</td>
-                        <td id="str-pe-ltp">--</td>
-                        <td id="str-pe-pnl">--</td>
+                        <td id="scalp-pe-ltp">--</td>
+                        <td id="scalp-pe-pnl">--</td>
                     </tr>
                 `;
                 
                 // Fetch live P&L
-                fetchLivePnl('straddle');
+                fetchLivePnl('daily_scalp');
             } else {
-                strPos.style.display = 'none';
+                scalpPos.style.display = 'none';
             }
         }
         
@@ -3537,41 +3523,61 @@ DASHBOARD_HTML = """
                     document.getElementById('ic-target-label').textContent = '+' + ic.target_pct + '%';
                 }
                 
-                if (strategy === 'straddle' && data.straddle) {
-                    const str = data.straddle;
-                    const pnl = str.pnl_amount || 0;
-                    const pnlPct = str.pnl_percent || 0;
+                if (strategy === 'daily_scalp' && data.daily_scalp) {
+                    const sc = data.daily_scalp;
+                    const pnl = sc.pnl_amount || 0;
+                    const pnlPct = sc.pnl_percent || 0;
                     
                     // Update header P&L
-                    const pnlEl = document.getElementById('str-pnl');
+                    const pnlEl = document.getElementById('scalp-pnl');
                     pnlEl.textContent = '₹' + pnl.toLocaleString('en-IN', {maximumFractionDigits: 0});
                     pnlEl.className = 'position-pnl ' + (pnl >= 0 ? 'positive' : 'negative');
                     
                     // Update current premium
-                    document.getElementById('str-current-premium').textContent = '₹' + (str.current_premium || 0).toFixed(2);
+                    document.getElementById('scalp-current-premium').textContent = '₹' + (sc.current_premium || 0).toFixed(2);
                     
                     // Update unrealized P&L
-                    const unrealizedEl = document.getElementById('str-unrealized-pnl');
+                    const unrealizedEl = document.getElementById('scalp-unrealized-pnl');
                     unrealizedEl.textContent = '₹' + pnl.toLocaleString('en-IN', {maximumFractionDigits: 0});
                     unrealizedEl.className = 'pnl-value ' + (pnl >= 0 ? 'positive' : 'negative');
                     
                     // Update P&L %
-                    document.getElementById('str-pnl-pct').textContent = (pnl >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%';
+                    document.getElementById('scalp-pnl-pct').textContent = (pnl >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%';
+                    
+                    // Update spot movement
+                    const spotMove = sc.spot_move || 0;
+                    const spotMoveEl = document.getElementById('scalp-spot-move');
+                    spotMoveEl.textContent = (spotMove >= 0 ? '+' : '') + spotMove.toFixed(0) + ' pts';
+                    spotMoveEl.style.color = Math.abs(spotMove) > (sc.spot_sl_points || 150) * 0.7 ? '#ff5252' : (Math.abs(spotMove) > (sc.spot_sl_points || 150) * 0.5 ? '#ffa726' : '#00c853');
+                    document.getElementById('scalp-spot-sl-display').textContent = sc.spot_sl_points || 150;
+                    
+                    // Update peak P&L and trailing SL
+                    const peakPnl = sc.peak_pnl_pct || 0;
+                    document.getElementById('scalp-peak-pnl').textContent = '+' + peakPnl.toFixed(1) + '%';
+                    
+                    if (peakPnl >= 15) {  // SCALP_TRAIL_ACTIVATE_PCT default
+                        const trailLevel = peakPnl - 10; // SCALP_TRAIL_OFFSET_PCT default
+                        document.getElementById('scalp-trailing-sl-level').textContent = '+' + trailLevel.toFixed(1) + '% ✓';
+                        document.getElementById('scalp-trailing-sl-level').style.color = '#ffa726';
+                    } else {
+                        document.getElementById('scalp-trailing-sl-level').textContent = 'Not active';
+                        document.getElementById('scalp-trailing-sl-level').style.color = '#666';
+                    }
                     
                     // Update current prices in table
-                    if (str.current_prices) {
-                        document.getElementById('str-ce-ltp').textContent = '₹' + (str.current_prices.ce || 0).toFixed(2);
-                        document.getElementById('str-pe-ltp').textContent = '₹' + (str.current_prices.pe || 0).toFixed(2);
+                    if (sc.current_prices) {
+                        document.getElementById('scalp-ce-ltp').textContent = '₹' + (sc.current_prices.ce || 0).toFixed(2);
+                        document.getElementById('scalp-pe-ltp').textContent = '₹' + (sc.current_prices.pe || 0).toFixed(2);
                     }
                     
                     // Update progress bar
-                    const progress = document.getElementById('str-progress');
-                    const progressPct = Math.min(100, Math.max(0, ((pnlPct + str.stoploss_pct) / (str.target_pct + str.stoploss_pct)) * 100));
+                    const progress = document.getElementById('scalp-progress');
+                    const progressPct = Math.min(100, Math.max(0, ((pnlPct + sc.stoploss_pct) / (sc.target_pct + sc.stoploss_pct)) * 100));
                     progress.style.left = progressPct + '%';
                     
                     // Update labels
-                    document.getElementById('str-sl-label').textContent = '-' + str.stoploss_pct + '%';
-                    document.getElementById('str-target-label').textContent = '+' + str.target_pct + '%';
+                    document.getElementById('scalp-sl-label').textContent = '-' + sc.stoploss_pct + '%';
+                    document.getElementById('scalp-target-label').textContent = '+' + sc.target_pct + '%';
                 }
             } catch (e) {
                 console.error('Error fetching live P&L:', e);
@@ -3815,7 +3821,7 @@ def api_position():
     result = {
         "has_position": False,
         "iron_condor": None,
-        "straddle": None,
+        "daily_scalp": None,
         "total_unrealized_pnl": 0,
         "last_update": pos_data.get("last_update", "")
     }
@@ -3824,26 +3830,24 @@ def api_position():
         result["has_position"] = True
         result["iron_condor"] = pos_data["iron_condor"]
     
-    if pos_data.get("straddle"):
+    if pos_data.get("daily_scalp"):
         result["has_position"] = True
-        result["straddle"] = pos_data["straddle"]
+        result["daily_scalp"] = pos_data["daily_scalp"]
     
     return jsonify(result)
 
 # Global references for live P&L (set by bot_thread)
 _live_ic = None
-_live_straddle = None
 _live_scalp = None
 
 @app.route('/api/live_pnl')
 def api_live_pnl():
     """Get real-time P&L for active positions"""
-    global _live_ic, _live_straddle, _live_scalp
+    global _live_ic, _live_scalp
     
     strategy = request.args.get("strategy", "all")
     result = {
         "iron_condor": None,
-        "straddle": None,
         "daily_scalp": None
     }
     
@@ -3853,18 +3857,13 @@ def api_live_pnl():
         if pnl_data:
             result["iron_condor"] = pnl_data
     
-    if strategy in ["straddle", "all"] and _live_straddle and _live_straddle.position:
-        pnl_data = _live_straddle.get_live_pnl()
-        if pnl_data:
-            result["straddle"] = pnl_data
-    
     if strategy in ["daily_scalp", "all"] and _live_scalp and _live_scalp.position:
         pnl_data = _live_scalp.get_live_pnl()
         if pnl_data:
             result["daily_scalp"] = pnl_data
     
     # Fallback to stored position data if live not available
-    if not result["iron_condor"] and not result["straddle"] and not result["daily_scalp"]:
+    if not result["iron_condor"] and not result["daily_scalp"]:
         pos_data = load_position()
         if pos_data.get("iron_condor"):
             result["iron_condor"] = {
@@ -3875,16 +3874,6 @@ def api_live_pnl():
                 "target_pct": IC_TARGET_PERCENT,
                 "stoploss_pct": IC_STOP_LOSS_PERCENT,
                 "current_prices": pos_data["iron_condor"].get("entry_prices", {})
-            }
-        if pos_data.get("straddle"):
-            result["straddle"] = {
-                "entry_premium": pos_data["straddle"].get("entry_premium", 0),
-                "current_premium": pos_data["straddle"].get("entry_premium", 0),
-                "pnl_amount": 0,
-                "pnl_percent": 0,
-                "target_pct": STR_TARGET_PERCENT,
-                "stoploss_pct": STR_STOP_LOSS_PERCENT,
-                "current_prices": pos_data["straddle"].get("entry_prices", {})
             }
         if pos_data.get("daily_scalp"):
             result["daily_scalp"] = {
