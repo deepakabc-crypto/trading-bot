@@ -122,14 +122,6 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # Increased to 60 
 # Auto-start trading
 AUTO_START = os.environ.get("AUTO_START", "true").lower() == "true"
 
-# Expiry settings
-USE_CURRENT_EXPIRY = os.environ.get("USE_CURRENT_EXPIRY", "false").lower() == "true"  # Use current week expiry even on Thursday
-EXPIRY_DAY_CUTOFF = os.environ.get("EXPIRY_DAY_CUTOFF", "09:30")  # After this time on Thursday, use next expiry
-
-# Custom expiry override (for holiday-shifted expiries)
-# Format: DD-MM-YYYY or YYYY-MM-DD (e.g., "17-02-2026" or "2026-02-17")
-CUSTOM_EXPIRY = os.environ.get("CUSTOM_EXPIRY", "")  # Set this when expiry is not on Thursday
-
 PORT = int(os.environ.get("PORT", 5000))
 
 # Timezone handling for IST
@@ -293,7 +285,7 @@ def get_weekly_expiries(start_date: datetime, end_date: datetime) -> List[dateti
     return expiries
 
 def parse_custom_expiry(expiry_str: str) -> datetime:
-    """Parse custom expiry date from various formats"""
+    """Parse expiry date from various formats"""
     formats = [
         "%d-%m-%Y",    # 17-02-2026
         "%Y-%m-%d",    # 2026-02-17
@@ -307,27 +299,20 @@ def parse_custom_expiry(expiry_str: str) -> datetime:
             continue
     return None
 
+# Expiry cache — avoids repeated API calls within the same day
+_expiry_cache = {"date": None, "expiry": None}
+
 def get_next_expiry(from_date: datetime = None) -> datetime:
-    """Get the next weekly expiry date
+    """Get the next weekly expiry date — AUTO-DETECTED from Breeze API.
     
     Priority:
-    1. CUSTOM_EXPIRY environment variable (for holiday-shifted expiries)
-    2. Calculated Thursday expiry
+    1. Cached expiry (if same day)
+    2. Breeze API — fetch Nifty futures/option chain to discover real expiry
+    3. Fallback — calculated Thursday (handles normal weeks)
     
-    On Thursday (expiry day):
-    - Before cutoff time: Use current day's expiry (if USE_CURRENT_EXPIRY=true)
-    - After cutoff time: Use next week's expiry
+    Handles holiday-shifted expiries automatically (e.g., Thursday holiday → 
+    Wednesday/Monday expiry) by querying the exchange for live contracts.
     """
-    
-    # Check for custom expiry override first
-    if CUSTOM_EXPIRY:
-        custom = parse_custom_expiry(CUSTOM_EXPIRY)
-        if custom:
-            logger.info(f"📅 Using CUSTOM_EXPIRY: {custom.strftime('%d-%b-%Y')}")
-            return custom
-        else:
-            logger.warning(f"⚠️ Could not parse CUSTOM_EXPIRY: {CUSTOM_EXPIRY}")
-    
     if from_date is None:
         from_date = get_ist_now()
     
@@ -335,16 +320,143 @@ def get_next_expiry(from_date: datetime = None) -> datetime:
     if hasattr(from_date, 'tzinfo') and from_date.tzinfo is not None:
         from_date = from_date.replace(tzinfo=None)
     
-    current_weekday = from_date.weekday()  # Monday=0, Thursday=3
+    today_str = from_date.strftime("%Y-%m-%d")
+    
+    # Return cached if same day
+    if _expiry_cache["date"] == today_str and _expiry_cache["expiry"]:
+        return _expiry_cache["expiry"]
+    
+    # === TRY BREEZE API FIRST ===
+    api_expiry = _fetch_expiry_from_api(from_date)
+    if api_expiry:
+        _expiry_cache["date"] = today_str
+        _expiry_cache["expiry"] = api_expiry
+        logger.info(f"📅 Expiry from API: {api_expiry.strftime('%d-%b-%Y')} ({api_expiry.strftime('%A')})")
+        return api_expiry
+    
+    # === FALLBACK: Calculate Thursday ===
+    expiry = _calculate_next_thursday(from_date)
+    _expiry_cache["date"] = today_str
+    _expiry_cache["expiry"] = expiry
+    logger.info(f"📅 Expiry (calculated): {expiry.strftime('%d-%b-%Y')} ({expiry.strftime('%A')})")
+    return expiry
+
+def _fetch_expiry_from_api(from_date: datetime) -> datetime:
+    """Fetch real expiry date from Breeze API by probing Nifty futures/options.
+    
+    Strategy:
+    1. Get Nifty futures quote — response contains expiry_date
+    2. If that fails, probe candidate dates (Thu, Wed, Mon, Tue, Fri) with 
+       option chain to find which one has live contracts
+    """
+    if not BREEZE_AVAILABLE:
+        return None
+    
+    try:
+        # Try connecting (use existing connection if available)
+        from breeze_connect import BreezeConnect
+        
+        data_obj = load_data()
+        session = data_obj.get("session_token") or API_SESSION
+        if not session or not API_KEY:
+            return None
+        
+        breeze = BreezeConnect(api_key=API_KEY)
+        breeze.generate_session(api_secret=API_SECRET, session_token=session)
+        
+        # === METHOD 1: Get Nifty futures quote — expiry_date is in the response ===
+        try:
+            # Try current week's Thursday first
+            thursday = _calculate_next_thursday(from_date)
+            
+            # Try getting futures quote with this expiry
+            exp_str = format_expiry_for_breeze(thursday)
+            data = breeze.get_quotes(
+                stock_code="NIFTY", exchange_code="NFO",
+                expiry_date=exp_str, product_type="futures",
+                right="others", strike_price="0"
+            )
+            if data and data.get('Success') and data['Success']:
+                # Futures responded — this Thursday is a valid expiry
+                resp_expiry = data['Success'][0].get('expiry_date', '')
+                if resp_expiry:
+                    parsed = parse_custom_expiry(resp_expiry)
+                    if parsed and parsed >= from_date.replace(hour=0, minute=0, second=0, microsecond=0):
+                        return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+                # If response exists but no parseable expiry, Thursday is valid
+                return thursday
+        except Exception as e:
+            logger.debug(f"Futures expiry probe failed: {e}")
+        
+        # === METHOD 2: Probe candidate dates with ATM option quotes ===
+        # Generate candidate expiry dates for this week and next
+        # Check Thu, Wed, Mon, Tue, Fri — covers all holiday-shift scenarios
+        candidates = []
+        current_weekday = from_date.weekday()
+        
+        for week_offset in [0, 1]:  # This week + next week
+            base = from_date + timedelta(weeks=week_offset)
+            # Thursday first (normal), then Wed, Mon, Tue, Fri
+            for target_day in [3, 2, 0, 1, 4]:
+                days_ahead = target_day - base.weekday()
+                if days_ahead < 0 and week_offset == 0:
+                    continue  # Skip past days this week
+                candidate = base + timedelta(days=days_ahead)
+                candidate = candidate.replace(hour=0, minute=0, second=0, microsecond=0)
+                if candidate >= from_date.replace(hour=0, minute=0, second=0, microsecond=0):
+                    candidates.append(candidate)
+        
+        # Remove duplicates and sort
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            c_str = c.strftime("%Y-%m-%d")
+            if c_str not in seen:
+                seen.add(c_str)
+                unique_candidates.append(c)
+        unique_candidates.sort()
+        
+        # Try ATM option at each candidate
+        spot_data = breeze.get_quotes(stock_code="NIFTY", exchange_code="NSE", product_type="cash")
+        spot = 25500  # fallback
+        if spot_data and spot_data.get('Success') and spot_data['Success']:
+            spot = float(spot_data['Success'][0].get('ltp', 25500))
+        atm = round(spot / 50) * 50
+        
+        for candidate in unique_candidates[:6]:  # Check max 6 candidates
+            try:
+                exp_str = format_expiry_for_breeze(candidate)
+                data = breeze.get_quotes(
+                    stock_code="NIFTY", exchange_code="NFO",
+                    expiry_date=exp_str, product_type="options",
+                    right="call", strike_price=str(atm)
+                )
+                if data and data.get('Success') and data['Success']:
+                    ltp = float(data['Success'][0].get('ltp', 0))
+                    if ltp > 0:
+                        logger.info(f"📅 Validated expiry via option probe: {candidate.strftime('%d-%b-%Y')} (ATM CE LTP: {ltp})")
+                        return candidate
+                time.sleep(0.5)  # Rate limit between probes
+            except:
+                continue
+        
+    except Exception as e:
+        logger.debug(f"API expiry detection failed: {e}")
+    
+    return None
+
+def _calculate_next_thursday(from_date: datetime) -> datetime:
+    """Calculate next Thursday as fallback expiry"""
+    current_weekday = from_date.weekday()
     current_time = from_date.strftime("%H:%M")
     
     # Thursday = 3
-    if current_weekday == 3:  # It's Thursday (expiry day)
-        if USE_CURRENT_EXPIRY and current_time < EXPIRY_DAY_CUTOFF:
-            # Use today's expiry (before cutoff)
+    if current_weekday == 3:  # It's Thursday (likely expiry day)
+        if current_time < "15:30":
+            # Market still open — use today's expiry
             return from_date.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
-            # Use next Thursday
+            # After market — use next Thursday
             return from_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=7)
     
     # For other days, find next Thursday
@@ -2247,8 +2359,6 @@ def bot_thread():
     logger.info(f"   Min Premium: {SCALP_MIN_PREMIUM}")
     
     # Log expiry info
-    if CUSTOM_EXPIRY:
-        logger.info(f"📅 CUSTOM_EXPIRY set: {CUSTOM_EXPIRY}")
     next_exp = get_next_expiry()
     logger.info(f"📅 Next Expiry: {next_exp.strftime('%d-%b-%Y')} ({next_exp.strftime('%A')})")
     
@@ -3994,7 +4104,6 @@ def api_status():
         "is_trading_time": is_trading_time(),
         "is_exit_time": is_exit_time(),
         "is_market_hours": is_market_hours(),
-        "custom_expiry": CUSTOM_EXPIRY if CUSTOM_EXPIRY else None,
         "next_expiry": next_exp.strftime("%d-%b-%Y"),
         "next_expiry_day": next_exp.strftime("%A"),
         "next_expiry_breeze": format_expiry_for_breeze(next_exp),
